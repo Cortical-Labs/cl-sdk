@@ -1,8 +1,11 @@
+from __future__ import annotations
 import time
 from numpy import ndarray
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
+from typing import cast
 import math
+import gc
 
 from cl import DetectionResult
 from cl.util import frames_to_approximate_seconds, ordinal
@@ -17,7 +20,7 @@ class LoopTick:
     variables (such as analysis) beyond the end of the loop body,
     copy them to another variable.
     """
-    loop: "Loop"
+    loop: Loop
     """ A reference to the running Loop. """
 
     iteration: int = 0
@@ -26,10 +29,10 @@ class LoopTick:
     timestamp: int = -1
     """ The start timestamp of the tick period. """
 
-    analysis: DetectionResult | None = None
+    analysis: DetectionResult = cast(DetectionResult, None) # Guaranteed to be set in loop
     """ Contains the spikes and stims analysis of the frames read during the tick. """
 
-    frames: ndarray | None = None
+    frames: ndarray = cast(ndarray, None) # Guaranteed to be set in loop
     """ The frames read during the tick period. """
 
 class Loop:
@@ -176,21 +179,23 @@ class Loop:
         # iterations only contain stims conducted in the previous iteration
         neurons._tick_stims.clear()
 
-        # The mock Neurons API, does not track passage of actual time to allow
-        # replay to occur at maximum speed. However, we want to simulate jitter
-        # failure due to slow user operation between each tick. To do this, we
-        # need awareness of actual passage of time.
-        real_next_time = time.time()
+        # Keep track of wall clock time to calculate jitter failure.
+        next_wall_time = time.perf_counter()
         now            = timestamp()
+
+        # We will disable garbage collection as this is known to cause
+        # latency spikes, and restore it after we exit out of the loop.
+        restore_gc = gc.isenabled()
+        gc.disable()
 
         while tick.iteration < self._stop_after_ticks:
             # When considering jitter failure, we take the maximum number of
             # frames elapsed during a loop iteration between simulated and real
-            real_now         = time.time()
-            real_tick_secs   = real_now - real_next_time
-            real_tick_frames = int(real_tick_secs) * frames_per_second
-            real_next_time   = real_now
-            now              = max(timestamp(), now + real_tick_frames)
+            wall_now         = time.perf_counter()
+            wall_tick_secs   = wall_now - next_wall_time
+            wall_tick_frames = int(wall_tick_secs) * frames_per_second
+            next_wall_time   = wall_now
+            now              = max(timestamp(), now + wall_tick_frames)
 
             if now > next_deadline_ts:
                 self._handle_jitter_failure(start_ts, next_ts, frames_per_tick, now, tick)
@@ -212,4 +217,6 @@ class Loop:
             next_deadline_ts += frames_per_tick
             tick.iteration   += 1
 
+        if restore_gc:
+            gc.enable()
         return
