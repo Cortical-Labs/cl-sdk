@@ -188,7 +188,7 @@ class Benchmark:
     def __init__(self, name: str = "Benchmark", report_threshold_us: int = 0):
         """
         Args:
-            name: Benchmark name.
+            name:                Benchmark name.
             report_threshold_us: Print code execution time if threshold is exceeded.
         """
         self.name                = name
@@ -207,12 +207,20 @@ class Benchmark:
                 duration_us = duration_ns / 1000.0
                 print(f"{self.name}: took {duration_us:.3f} µs")
 
-def more_accurate_sleep(seconds):
+def more_accurate_sleep(seconds: float, buffer_secs: float = 1e-1):
     """
-    Attempt a more accurate sleep by wasting CPU
+    Attempt a more accurate sleep by wasting CPU for a short duration.
+
+    Args:
+        seconds:     number of total seconds to sleep.
+        buffer_secs: short duration that we waste CPU cycles for more responsive wake.
     """
+    if not seconds > 0:
+        return
     end = time.perf_counter() + seconds
-    # if seconds > 0.1:
-    #     time.sleep(seconds - 0.1)
+    if seconds > buffer_secs:
+        # This is power efficient but may have a variable amount of latency
+        time.sleep(seconds - buffer_secs)
     while time.perf_counter() < end:
+        # This is to minimise latency but not power efficient
         pass

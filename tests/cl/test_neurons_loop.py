@@ -60,7 +60,6 @@ def test_neurons_read():
 
         # Test 2: Reading from > 5 secs in the past
         with pytest.raises(Exception):
-            #
             neurons.read(frames_to_read, int(neurons.timestamp() - 5.1 * neurons._frames_per_second))
 
         # Test 3: Reading from past
@@ -108,7 +107,6 @@ def test_neurons_read_accelerated():
 
         # Test 2: Reading from > 5 secs in the past
         with pytest.raises(Exception):
-            #
             neurons.read(frames_to_read, int(neurons.timestamp() - 5.1 * neurons._frames_per_second))
 
         # Test 3: Reading from past
@@ -133,7 +131,6 @@ def test_neurons_read_accelerated():
         expected   = from_ts + frames_to_read
         assert calculated == expected
 
-@pytest.mark.skip(reason="Await fixes to loop timing")
 def test_neurons_loop():
     """
     Tests neurons.loop(), such as:
@@ -192,7 +189,8 @@ def test_neurons_loop():
         # Test jitter failure from neurons.read()
         neurons_loop: Loop = neurons.loop(
             ticks_per_second        = ticks_per_second,
-            jitter_tolerance_frames = jitter_frames
+            jitter_tolerance_frames = jitter_frames,
+            stop_after_ticks        = 2
             )
         with pytest.raises(TimeoutError):
             for tick in neurons_loop:
@@ -209,7 +207,6 @@ def test_neurons_loop():
                 if tick.iteration > 0:
                     break
 
-@pytest.mark.skip(reason="Await fixes to loop timing")
 def test_neurons_loop_accelerated():
     """
     Tests neurons.loop(), such as:
