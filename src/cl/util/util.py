@@ -207,7 +207,7 @@ class Benchmark:
                 duration_us = duration_ns / 1000.0
                 print(f"{self.name}: took {duration_us:.3f} µs")
 
-def more_accurate_sleep(seconds: float, buffer_secs: float = 1e-1):
+def more_accurate_sleep(seconds: float, buffer_secs: float = 0.1):
     """
     Attempt a more accurate sleep by wasting CPU for a short duration.
 
@@ -222,5 +222,5 @@ def more_accurate_sleep(seconds: float, buffer_secs: float = 1e-1):
         # This is power efficient but may have a variable amount of latency
         time.sleep(seconds - buffer_secs)
     while time.perf_counter() < end:
-        # This is to minimise latency but not power efficient
+        # This is to increase accuracy but not power efficient
         pass

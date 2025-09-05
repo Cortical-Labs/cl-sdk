@@ -72,6 +72,8 @@ The Mock API simulates spikes and samples by replaying recordings as set by the 
 - `CL_MOCK_DURATION_SEC`: Duration of the temporary recording (default 60); and
 - `CL_MOCK_RANDOM_SEED`: Random seed (defaults to Unix time).
 
+The starting position of the replay recording will be randomised every time `cl.open()` is called. This can be overriden by setting `CL_MOCK_REPLAY_START_OFFSET`, where a value of `0` indicates from the first frame of the recording.
+
 ### Speed of simulation
 
 The Mock API can operate in two timing modes:
