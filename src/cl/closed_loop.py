@@ -2,15 +2,13 @@ from __future__ import annotations
 import time
 from numpy import ndarray
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
-from typing import cast
+from dataclasses import dataclass, field
 import math
 import gc
 
 from cl import DetectionResult
 from cl.util import frames_to_approximate_seconds, ordinal
 
-@dataclass
 class LoopTick:
     """
     Contains spikes and frames detected during a loop iteration.
@@ -23,17 +21,21 @@ class LoopTick:
     loop: Loop
     """ A reference to the running Loop. """
 
-    iteration: int = 0
+    iteration: int
     """ Iteration count of this LoopTick within the Loop. """
 
-    timestamp: int = -1
+    timestamp: int
     """ The start timestamp of the tick period. """
 
-    analysis: DetectionResult = cast(DetectionResult, None) # Guaranteed to be set in loop
+    analysis: DetectionResult
     """ Contains the spikes and stims analysis of the frames read during the tick. """
 
-    frames: ndarray = cast(ndarray, None) # Guaranteed to be set in loop
+    frames:   ndarray
     """ The frames read during the tick period. """
+
+    def __init__(self, loop: Loop):
+        self.loop      = loop
+        self.iteration = 0
 
 class Loop:
 
@@ -131,6 +133,10 @@ class Loop:
         """
         late_frames = now - (next_ts + frames_per_tick)
         late_us     = late_frames * self._neurons.get_frame_duration_us()
+
+        # Allow a small amount of jitter as desktop OS will likely have higher latency than CL1
+        if late_frames <= 20:
+            return
 
         def frames_str(frame_count):
             return f"{frame_count} {'frame' if frame_count == 1 else 'frames'}"

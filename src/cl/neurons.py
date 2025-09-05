@@ -3,6 +3,7 @@ from queue import PriorityQueue
 from typing import Any, Literal
 from pathlib import Path
 from collections.abc import Sequence, Callable
+from collections import defaultdict
 import os
 import time
 from random import randint
@@ -78,6 +79,10 @@ class Neurons:
 
         self._start_walltime_ns           = time.perf_counter_ns()
         self._prev_walltime_ns            = self._start_walltime_ns
+
+        buffer_size_bytes                 = (16 * 1024 * 1024)
+        buffer_size_int16                 = 2
+        self._buffer_timestamps           = int(buffer_size_bytes / buffer_size_int16 / self._channel_count)
 
         load_dotenv(".env")
         self._use_accelerated_time        = os.getenv("CL_MOCK_ACCELERATED_TIME", "0") == "1"
@@ -155,7 +160,7 @@ class Neurons:
 
     def has_started(self) -> bool:
         """ Returns True if the device has started. """
-        return self._status == "started"
+        return self._is_running
 
     def is_readable(self) -> bool:
         """ Returns True if the device can be read from. """
@@ -216,9 +221,9 @@ class Neurons:
         to_timestamp      = from_timestamp + frame_count
         frames_to_advance = 0 if (to_timestamp <= now) else (to_timestamp - now)
 
-        # The system will allow reading from up to 5 secs in the past
-        if from_timestamp < now - int(5 * self._frames_per_second):
-            raise Exception(f"read did not succeed")
+        # The system will allow reading from up to ~ 5 secs in the past
+        if from_timestamp < now - self._buffer_timestamps:
+            raise Exception(f"requested read from past timestamp exceeds buffer capacity")
 
         assert self._replay_file.samples is not None, "replay file does not contain samples"
         replay_frames = self._replay_file.samples
@@ -228,21 +233,23 @@ class Neurons:
         # requested frame_count is longer than duration_frames, then we
         # will wrap from the beginning of the recording. We also work in
         # elapsed_frames (ts - start_timestamp) for accurate indices.
-        op_timestamp                     = from_timestamp - self._start_timestamp + self._replay_start_offset
-        op_end_timestamp                 = to_timestamp   - self._start_timestamp + self._replay_start_offset
-        start_idx                        = op_timestamp   % self._duration_frames
-        read_frame_chunks: list[ndarray] = []
+        op_timestamp     = from_timestamp - self._start_timestamp + self._replay_start_offset
+        op_end_timestamp = to_timestamp   - self._start_timestamp + self._replay_start_offset
+        replay_start     = op_timestamp   % self._duration_frames
+        read_start       = 0
+        read_frames      = np.empty((frame_count, self._channel_count), dtype=np.int16)
         while op_timestamp < op_end_timestamp:
             # Read the frames
-            remaining_frames = op_end_timestamp - op_timestamp
-            end_idx          = min(self._duration_frames, start_idx + remaining_frames)
-            read_frame_chunks.append(replay_frames[start_idx:end_idx, :])
+            remaining_frames                    = op_end_timestamp - op_timestamp
+            replay_end                          = min(self._duration_frames, replay_start + remaining_frames)
+            read_end                            = read_start + (replay_end - replay_start)
+            read_frames[read_start:read_end, :] = replay_frames[replay_start:replay_end, :]
 
             # Prepare pointers for next wrapping iteration
-            op_timestamp += (end_idx - start_idx)
-            start_idx = end_idx % self._duration_frames
+            op_timestamp += (replay_end - replay_start)
+            replay_start  = replay_end  % self._duration_frames
+            read_start    = read_end
 
-        read_frames = np.concat(read_frame_chunks).copy()
         self._recording_samples.append(read_frames)
 
         if to_timestamp > self._read_timestamp:
@@ -564,7 +571,7 @@ class Neurons:
 
     def start(self):
         """ Start the device if has not already started. """
-        self._status = "started"
+        self._is_running = True
 
     def restart(
         self,
@@ -576,13 +583,13 @@ class Neurons:
 
     def stop(self):
         """ Stop the device if it has started. """
-        self._status = "stopped"
+        self._is_running = False
 
     #
     # Mock specific functionality, do not use these in your applications.
     #
 
-    _status: Literal["started", "stopped"] = "stopped"
+    _is_running: bool = False
     """ (Mock only) Indicates the current status. """
 
     _replay_file: RecordingView
@@ -648,6 +655,9 @@ class Neurons:
     _data_streams: dict[str, DataStream] = {}
     """ (Mock only) Record of all DataStreams in use. """
 
+    _buffer_timestamps: int
+    """ (Mock only) Approximation of the device ring buffer size in timestamps. """
+
     def _advance_elapsed_frames(self, frame_count: int = 0):
         """
         (Mock only) Advances the _elapsed_frames counter one frame at a time to
@@ -668,35 +678,32 @@ class Neurons:
             frame_count            = int(elapsed_walltime_ns * self._frames_per_second / 1e9)
             blocking_mode          = False
 
-        for _ in range(frame_count):
-            self._elapsed_frames += 1
-            now                   = self._start_timestamp + self._elapsed_frames
+        # Increment elapsed frames and calculate the next timestamp
+        self._elapsed_frames += frame_count
+        next_timestamp        = self._start_timestamp + self._elapsed_frames
 
-            # We check whether we have reached the timestamp for the next
-            # stim in the stim_queue. If so, simulate a stim by moving the stim
-            # from the stim_queue to stims_conducted.
-            stim_queue             = self._stim_queue
-            stim_ch_msg: list[int] = []
-            while (stim_queue.qsize() > 0):
-                if stim_queue.queue[0][0] > now:
-                    break
-                stim_ts, stim = self._stim_queue.get()
-                self._recording_stims.append(stim)
-                self._tick_stims.append(stim)
-                stim_ch_msg.append(stim.channel)
+        # Perform any stims in the queue
+        stim_queue = self._stim_queue
+        stim_ch_msg: dict[int, list[int]] = defaultdict(list)
+        while (stim_queue.qsize() > 0):
+            if stim_queue.queue[0][0] > next_timestamp:
+                break
+            stim_ts, stim = self._stim_queue.get()
+            self._recording_stims.append(stim)
+            self._tick_stims.append(stim)
+            stim_ch_msg[stim_ts].append(stim.channel)
 
-            # This is for a verbose message to let the user know we've performed a stim
-            if len(stim_ch_msg) > 0:
-                _logger.debug(f"stim at {now} on channels {stim_ch_msg}")
-                stim_ch_msg.clear()
+        # This is for a verbose message to let the user know we've performed a stim
+        for stim_ts, stim_chs in stim_ch_msg.items():
+            _logger.debug(f"stim at {stim_ts} on channels {stim_chs}")
 
-            # We we also call any _timed_ops when reaching the appropriate timestamp.
-            ops_queue = self._timed_ops
-            while (ops_queue.qsize() > 0):
-                if ops_queue.queue[0][0] > now:
-                    break
-                op_ts, op = ops_queue.get()
-                op()
+        # Perform any operations in the queue
+        ops_queue = self._timed_ops
+        while (ops_queue.qsize() > 0):
+            if ops_queue.queue[0][0] > next_timestamp:
+                break
+            op_ts, op = ops_queue.get()
+            op()
 
         # Here, we block the thread for the requested frame_count in wall clock time.
         if blocking_mode and not self._use_accelerated_time:
@@ -729,10 +736,6 @@ class Neurons:
         now               = self.timestamp()
         from_timestamp    = now if from_timestamp is None else from_timestamp
         to_timestamp      = from_timestamp + frame_count
-
-        # The system will allow reading from up to 5 secs in the past
-        if from_timestamp < now - int(5 * self._frames_per_second):
-            raise Exception(f"read did not succeed")
 
         assert self._replay_file.spikes  is not None, "replay file does not contain spikes"
         replay_spikes = self._replay_file.spikes

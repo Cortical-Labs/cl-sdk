@@ -207,7 +207,7 @@ class Benchmark:
                 duration_us = duration_ns / 1000.0
                 print(f"{self.name}: took {duration_us:.3f} µs")
 
-def more_accurate_sleep(seconds: float, buffer_secs: float = 1e-1):
+def more_accurate_sleep(seconds: float, buffer_secs: float = 0.1):
     """
     Attempt a more accurate sleep by wasting CPU for a short duration.
 
