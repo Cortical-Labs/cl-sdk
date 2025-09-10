@@ -3,16 +3,20 @@ import time
 import numpy as np
 
 import cl
-from cl.util import more_accurate_sleep
 
 def test_sleep():
     """ Test our sleep function to make sure that latency is within 1 frame. """
-    sleep_durations = [1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
-    tolerance       = 1 / 25_000
-    for duration in sleep_durations:
-        start = time.perf_counter()
-        more_accurate_sleep(duration, buffer_secs=1e-1)
-        assert np.allclose(time.perf_counter() - start, duration, atol=tolerance)
+    os.environ["CL_MOCK_ACCELERATED_TIME"] = "0"
+    sampling_frequency = 25_000
+    sleep_durations    = np.array([1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6])
+    sleep_frames       = (sleep_durations * sampling_frequency).astype(int)
+    tolerance          = 1 / sampling_frequency
+    with cl.open() as neurons:
+        for duration, frames in zip(sleep_durations, sleep_frames):
+            start_timestamp = neurons.timestamp()
+            start_secs      = time.perf_counter()
+            neurons._sleep_until(start_timestamp + frames)
+            assert np.allclose(time.perf_counter() - start_secs, duration, atol=tolerance)
 
 def test_read_latency():
     """ Test our read timing latency is within 100 frames. """
@@ -42,3 +46,14 @@ def test_read_latency():
                     assert np.allclose(test_ts, 0, atol=50)       # time to copy data
 
             print(f"ts {t} (+{test_ts})")
+
+def test_op_timing():
+    """ Test advance_elapsed_times and whether ops are called at the correct timestamp. """
+    os.environ["CL_MOCK_ACCELERATED_TIME"] = "1"
+    with cl.open() as neurons:
+        expected_timestamp = 137
+        def timed_operation(neurons=neurons):
+            actual_timestamp = neurons.timestamp()
+            assert actual_timestamp == expected_timestamp
+        neurons._timed_ops.put((expected_timestamp, timed_operation))
+        neurons.read(250, None)

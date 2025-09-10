@@ -24,7 +24,7 @@ from cl import (
 )
 from cl.stim_plan import StimPlan
 from cl.recording import Recording
-from cl.util import RecordingView, AttributesView, more_accurate_sleep
+from cl.util import RecordingView, AttributesView
 from cl.data_stream import DataStream
 
 class Neurons:
@@ -82,7 +82,7 @@ class Neurons:
 
         buffer_size_bytes                 = (16 * 1024 * 1024)
         buffer_size_int16                 = 2
-        self._buffer_timestamps           = int(buffer_size_bytes / buffer_size_int16 / self._channel_count)
+        self._buffer_size_frames          = int(buffer_size_bytes / buffer_size_int16 / self._channel_count)
 
         load_dotenv(".env")
         self._use_accelerated_time        = os.getenv("CL_MOCK_ACCELERATED_TIME", "0") == "1"
@@ -222,7 +222,7 @@ class Neurons:
         frames_to_advance = 0 if (to_timestamp <= now) else (to_timestamp - now)
 
         # The system will allow reading from up to ~ 5 secs in the past
-        if from_timestamp < now - self._buffer_timestamps:
+        if from_timestamp < now - self._buffer_size_frames:
             raise Exception(f"requested read from past timestamp exceeds buffer capacity")
 
         assert self._replay_file.samples is not None, "replay file does not contain samples"
@@ -455,7 +455,7 @@ class Neurons:
         ticks_per_second:        How often the loop should return a result.
         stop_after_seconds:      How long to run the closed loop for. (default:
                                  None, i.e. loop indefinitely)
-        stop_after_seconds:      How long to run the closed loop for. (default:
+        stop_after_ticks:        How long to run the closed loop for. (default:
                                  None, i.e. loop indefinitely)
         ignore_jitter:           If True, the loop will not raise a
                                  TimeoutError. (default: False)
@@ -655,8 +655,14 @@ class Neurons:
     _data_streams: dict[str, DataStream] = {}
     """ (Mock only) Record of all DataStreams in use. """
 
-    _buffer_timestamps: int
-    """ (Mock only) Approximation of the device ring buffer size in timestamps. """
+    _buffer_size_frames: int
+    """ (Mock only) Device ring buffer size. """
+
+    _sleep_latency_buffer_secs: float = 0.1
+    """
+    (Mock only) Buffer to account for latency when waking up from time.sleep()
+    that has been tested on a number of systems.
+    """
 
     def _advance_elapsed_frames(self, frame_count: int = 0):
         """
@@ -678,42 +684,74 @@ class Neurons:
             frame_count            = int(elapsed_walltime_ns * self._frames_per_second / 1e9)
             blocking_mode          = False
 
-        # Increment elapsed frames and calculate the next timestamp
-        self._elapsed_frames += frame_count
-        next_timestamp        = self._start_timestamp + self._elapsed_frames
+        # Advance elapsed_frames iteratively while performing queued stims and/or ops.
+        now              = self._start_timestamp + self._elapsed_frames
+        timestamp_target = now + frame_count
+        stim_queue       = self._stim_queue
+        ops_queue        = self._timed_ops
 
-        # Perform any stims in the queue
-        stim_queue = self._stim_queue
-        stim_ch_msg: dict[int, list[int]] = defaultdict(list)
-        while (stim_queue.qsize() > 0):
-            if stim_queue.queue[0][0] > next_timestamp:
-                break
-            stim_ts, stim = self._stim_queue.get()
-            self._recording_stims.append(stim)
-            self._tick_stims.append(stim)
-            stim_ch_msg[stim_ts].append(stim.channel)
+        while now < timestamp_target:
 
-        # This is for a verbose message to let the user know we've performed a stim
-        for stim_ts, stim_chs in stim_ch_msg.items():
-            _logger.debug(f"stim at {stim_ts} on channels {stim_chs}")
+            # Advance to the timestamp of the next queued stim or operation
+            next_stim_timestamp   = timestamp_target if stim_queue.qsize() < 1 else stim_queue.queue[0][0]
+            next_op_timestamp     = timestamp_target if ops_queue.qsize()  < 1 else ops_queue.queue[0][0]
+            next_timestamp        = min(next_stim_timestamp, next_op_timestamp, timestamp_target)
+            self._elapsed_frames += (next_timestamp - now)
+            now                   = next_timestamp
 
-        # Perform any operations in the queue
-        ops_queue = self._timed_ops
-        while (ops_queue.qsize() > 0):
-            if ops_queue.queue[0][0] > next_timestamp:
-                break
-            op_ts, op = ops_queue.get()
-            op()
+            # Perform any stims in the queue
+            stim_ch_msg: dict[int, list[int]] = defaultdict(list)
+            while (stim_queue.qsize() > 0):
+                if stim_queue.queue[0][0] > now:
+                    break
+                stim_ts, stim = self._stim_queue.get()
+                self._recording_stims.append(stim)
+                self._tick_stims.append(stim)
+                stim_ch_msg[stim_ts].append(stim.channel)
+
+            # This is for a verbose message to let the user know we've performed a stim
+            for stim_ts, stim_chs in stim_ch_msg.items():
+                _logger.debug(f"stim at {stim_ts} on channels {stim_chs}")
+
+            # Perform any operations in the queue
+            ops_queue = self._timed_ops
+            while (ops_queue.qsize() > 0):
+                if ops_queue.queue[0][0] > now:
+                    break
+                op_ts, op = ops_queue.get()
+                op()
 
         # Here, we block the thread for the requested frame_count in wall clock time.
         if blocking_mode and not self._use_accelerated_time:
-            current_walltime_ns    = time.perf_counter_ns()
-            elapsed_walltime_ns    = current_walltime_ns - self._prev_walltime_ns
-            wait_secs = (frame_count / self._frames_per_second) - (elapsed_walltime_ns / 1e9)
-            more_accurate_sleep(wait_secs)
+            self._sleep_until(timestamp_target)
 
         # Update the wall clock time before leaving
         self._prev_walltime_ns = time.perf_counter_ns()
+
+    def _sleep_until(self, timestamp: int):
+        """
+        (Mock only) Block the thread until the specified timestamp is reached.
+
+        Args:
+            timestamp: wake up the system at this timestamp
+        """
+        now                 = self._elapsed_frames + self._start_timestamp
+        frames_to_sleep     = timestamp - now
+        current_walltime_ns = time.perf_counter_ns()
+        elapsed_walltime_ns = current_walltime_ns - self._prev_walltime_ns
+        wait_secs           = (frames_to_sleep / self._frames_per_second) - (elapsed_walltime_ns / 1e9)
+
+        if not wait_secs > 0:
+            return
+
+        # We wake up the system earlier with a buffer to increase accuracy
+        end = time.perf_counter() + wait_secs
+        if wait_secs > self._sleep_latency_buffer_secs:
+            # This is power efficient but may have a variable amount of latency
+            time.sleep(wait_secs - self._sleep_latency_buffer_secs)
+        while time.perf_counter() < end:
+            # This is to increase accuracy but not power efficient
+            pass
 
     def _read_spikes(
         self,
