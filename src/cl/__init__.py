@@ -344,7 +344,7 @@ _CL_MOCK_REPLAY_PATH: str | None = None
 """ (Mock only) Path to the recording to be replayed, persisting each session. """
 
 def _generate_random_recording(
-    sample_mean:      int,
+    sample_mean:      float,
     spike_percentile: float,
     duration_sec:     float,
     random_seed:      int
