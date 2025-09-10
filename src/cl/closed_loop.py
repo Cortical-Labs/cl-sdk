@@ -9,6 +9,9 @@ import gc
 from cl import DetectionResult
 from cl.util import frames_to_approximate_seconds, ordinal
 
+_MIN_JITTER_TOLERANCE: int = 20
+""" (Mock only) Allow a small amount of jitter as desktop OS will likely have higher latency than CL1. """
+
 class LoopTick:
     """
     Contains spikes and frames detected during a loop iteration.
@@ -78,7 +81,7 @@ class Loop:
         self._tick                      = LoopTick(self)
         self._ticks_per_second          = ticks_per_second
         self._frames_per_tick           = int(neurons.get_frames_per_second() // ticks_per_second)
-        self._jitter_tolerance_frames   = int(2**31 - 1 if ignore_jitter else jitter_tolerance_frames)
+        self._jitter_tolerance_frames   = max(int(2**31 - 1 if ignore_jitter else jitter_tolerance_frames), _MIN_JITTER_TOLERANCE)
 
         # This is later updated to the timestamp of the first loop iteration.
         self.start_timestamp: int | str = "invalid timestamp"
@@ -133,10 +136,6 @@ class Loop:
         """
         late_frames = now - (next_ts + frames_per_tick)
         late_us     = late_frames * self._neurons.get_frame_duration_us()
-
-        # Allow a small amount of jitter as desktop OS will likely have higher latency than CL1
-        if late_frames <= 20:
-            return
 
         def frames_str(frame_count):
             return f"{frame_count} {'frame' if frame_count == 1 else 'frames'}"

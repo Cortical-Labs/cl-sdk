@@ -25,7 +25,7 @@ def test_recording(mocker: MockerFixture, tmp_path: Path):
     duration_sec = 20.0
     with cl.open() as neurons:
         neurons._elapsed_frames = 0
-        
+
         recording = neurons.record(file_location=str(tmp_path))
         timestamp = recording.start_timestamp
 
@@ -145,3 +145,22 @@ def test_recording(mocker: MockerFixture, tmp_path: Path):
             assert np.allclose(actual, expected)
         else:
             assert actual == expected
+
+def test_recording_frame_correctness():
+    """ Tests that neurons.read() is accurate, especially with wrapping replay file. """
+    os.environ["CL_MOCK_ACCELERATED_TIME"]    = "1"
+    os.environ["CL_MOCK_REPLAY_START_OFFSET"] = "0"
+    with cl.open() as neurons:
+        replay_duration = neurons._duration_frames
+        replay_samples  = neurons._replay_file.samples
+        replay_offset   = neurons._replay_start_offset
+        wrap_times      = 2
+        frames          = neurons.read(replay_duration * wrap_times, None)
+
+        assert replay_samples is not None
+        assert frames.shape[0] == replay_samples.shape[0] * wrap_times
+
+        for i in range(frames.shape[0]):
+            t = (i + replay_offset) % replay_duration
+            assert np.allclose(replay_samples[t, :], frames[i, :]), f"{frames.shape[0]=} {i=}, {t=}"
+        print("Pass!")
