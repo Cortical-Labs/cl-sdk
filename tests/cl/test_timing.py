@@ -3,7 +3,7 @@ import time
 import numpy as np
 
 import cl
-from cl.util import more_accurate_sleep
+from cl import Neurons
 
 def test_sleep():
     """ Test our sleep function to make sure that latency is within 1 frame. """
@@ -11,7 +11,7 @@ def test_sleep():
     tolerance       = 1 / 25_000
     for duration in sleep_durations:
         start = time.perf_counter()
-        more_accurate_sleep(duration, buffer_secs=1e-1)
+        Neurons._more_accurate_sleep(duration)
         assert np.allclose(time.perf_counter() - start, duration, atol=tolerance)
 
 def test_read_latency():
@@ -42,3 +42,14 @@ def test_read_latency():
                     assert np.allclose(test_ts, 0, atol=50)       # time to copy data
 
             print(f"ts {t} (+{test_ts})")
+
+def test_op_timing():
+    """ Test advance_elapsed_times and whether ops are called at the correct timestamp. """
+    os.environ["CL_MOCK_ACCELERATED_TIME"] = "1"
+    with cl.open() as neurons:
+        expected_timestamp = 137
+        def timed_operation(neurons=neurons):
+            actual_timestamp = neurons.timestamp()
+            assert actual_timestamp == expected_timestamp
+        neurons._timed_ops.put((expected_timestamp, timed_operation))
+        neurons.read(250, None)
