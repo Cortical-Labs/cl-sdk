@@ -188,7 +188,7 @@ class Benchmark:
     def __init__(self, name: str = "Benchmark", report_threshold_us: int = 0):
         """
         Args:
-            name: Benchmark name.
+            name:                Benchmark name.
             report_threshold_us: Print code execution time if threshold is exceeded.
         """
         self.name                = name
@@ -206,13 +206,3 @@ class Benchmark:
             if duration_ns >= self.report_threshold_ns:
                 duration_us = duration_ns / 1000.0
                 print(f"{self.name}: took {duration_us:.3f} µs")
-
-def more_accurate_sleep(seconds):
-    """
-    Attempt a more accurate sleep by wasting CPU
-    """
-    end = time.perf_counter() + seconds
-    # if seconds > 0.1:
-    #     time.sleep(seconds - 0.1)
-    while time.perf_counter() < end:
-        pass
