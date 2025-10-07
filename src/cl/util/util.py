@@ -216,3 +216,17 @@ def more_accurate_sleep(seconds):
     #     time.sleep(seconds - 0.1)
     while time.perf_counter() < end:
         pass
+
+def deprecated(replacement=None):
+    """ Decorator that marks a method as deprecated, and prints a warning on first use. """
+    def decorator(method):
+        def wrapper(*args, **kwargs):
+            if not hasattr(method, '_warned_deprecation'):
+                if replacement:
+                    print(f"{method.__name__} is deprecated, use {replacement} instead")
+                else:
+                    print(f"{method.__name__} is deprecated")
+                method._warned_deprecation = True
+            return method(*args, **kwargs)
+        return wrapper
+    return decorator

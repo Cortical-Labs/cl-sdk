@@ -3,6 +3,7 @@ from typing import Any
 from collections.abc import Sequence, Callable
 
 from cl import ChannelSet, StimDesign, BurstDesign
+from cl.util import deprecated
 
 @dataclass
 class Operation:
@@ -79,20 +80,24 @@ class StimPlan:
             args = (channels,)
             ))
 
-    def run(self):
+    def run(self, at_timestamp: int | None = None):
         """
-        Execute the queued operations in the StimPlan.
+        Execute the queued operations in the StimPlan. After this method is called,
+        the StimPlan is frozen and cannot be modified.
 
-        After this method is called, the StimPlan is frozen and cannot be modified.
+        Args:
+            at_timestamp: Run at this timestamp. StimPlan will run immediately if timestamp is in the past.
         """
-        self.run_at_timestamp(timestamp=self._neurons.timestamp())
+        timestamp = at_timestamp if at_timestamp is not None else self._neurons.timestamp()
+        self.frozen = True
+        for operation in self._operations:
+            operation.op(timestamp, *operation.args)
 
+    @deprecated("run(at_timestamp=)")
     def run_at_timestamp(self, timestamp: int):
         """
         Execute the queued operations in the StimPlan at a specified timestamp.
 
         After this method is called, the StimPlan is frozen and cannot be modified.
         """
-        self.frozen = True
-        for operation in self._operations:
-            operation.op(timestamp, *operation.args)
+        self.run(at_timestamp=timestamp)
