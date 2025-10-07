@@ -752,11 +752,11 @@ def test_stimplan_at_timestamp():
                     stim_plan.interrupt(ChannelSet(*range(64)))
             stim_plans.append(stim_plan)
 
-        # We use run_at_timestamp to schedule the stim plans, so that we
+        # We use run(at_timestamp) to schedule the stim plans, so that we
         # don't need to run these explicitly during the tick loop.
         for tick_iteration, (run_ts_offset, stim_plan) in enumerate(zip(run_ts_offsets, stim_plans)):
             run_ts = start_timestamp + (tick_frames * tick_iteration) + run_ts_offset
-            stim_plan.run_at_timestamp(run_ts)
+            stim_plan.run(at_timestamp=run_ts)
 
         observed_tick_stims: dict[int, list[Stim]] = {}
         neurons_loop = neurons.loop(
@@ -773,10 +773,14 @@ def test_stimplan_at_timestamp():
             for stim in tick.analysis.stims:
                 print(f"\t{stim.timestamp=} {stim.channel} {stim.timestamp-tick.timestamp=}")
 
+            if tick.iteration == 0:
+                # Unscheduled run(at_timestamp) with a past timestamp will execute immediately
+                stim_plans[0].run(at_timestamp=0)
+
         # We should expect to see two stims in iteration 1 and one stim in iteration 2
         expected_tick_stims: dict[int, list[Stim]] = {
             0: [
-                Stim(
+                Stim( # Scheduled stim_plans[0] first channel
                     channel=burst_channels[0][0],
                     timestamp=(
                         start_timestamp
@@ -785,7 +789,7 @@ def test_stimplan_at_timestamp():
                         + lead_time_frames
                         )
                     ),
-                Stim(
+                Stim( # Scheduled stim_plans[0] second channel
                     channel=burst_channels[0][1],
                     timestamp=(
                         start_timestamp
@@ -796,12 +800,33 @@ def test_stimplan_at_timestamp():
                     ),
             ],
             1: [
-                Stim(
+                Stim( # Unscheduled stim_plans[0] first channel
+                    channel=burst_channels[0][0],
+                    timestamp=(
+                        start_timestamp
+                        + (tick_frames * 1)
+                        + run_ts_offsets[1]
+                        + lead_time_frames
+                        )
+                    ),
+                Stim( # Scheduled stim_plans[1] second channel
                     channel=burst_channels[1][2],
                     timestamp=(
                         start_timestamp
                         + (tick_frames * 1)
                         + run_ts_offsets[1]
+                        + lead_time_frames
+                        )
+                    ),
+                Stim( # Unscheduled stim_plans[0] second channel
+                    channel=burst_channels[0][1],
+                    timestamp=(
+                        start_timestamp
+                        + (tick_frames * 1)
+                        + run_ts_offsets[1]
+                        + lead_time_frames
+                        # Waits until second channel becomes available from scheduled
+                        + biphasic_frames
                         + lead_time_frames
                         )
                     ),
