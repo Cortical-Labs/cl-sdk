@@ -169,6 +169,7 @@ class Loop:
         timestamp               = neurons.timestamp
         frames_per_tick         = self._frames_per_tick
         frames_per_second       = neurons.get_frames_per_second()
+        ns_per_frame            = int(1 / frames_per_second * 1_000_000_000)
         jitter_tolerance_frames = self._jitter_tolerance_frames
         read_frames             = neurons.read
         read_spikes             = neurons._read_spikes
@@ -185,8 +186,8 @@ class Loop:
         neurons._tick_stims.clear()
 
         # Keep track of wall clock time to calculate jitter failure.
-        next_wall_time = time.perf_counter()
-        now            = timestamp()
+        timestamp_start = timestamp()
+        wall_start      = time.perf_counter_ns()
 
         # We will disable garbage collection as this is known to cause
         # latency spikes, and restore it after we exit out of the loop.
@@ -195,12 +196,13 @@ class Loop:
 
         while tick.iteration < self._stop_after_ticks:
             # When considering jitter failure, we take the maximum number of
-            # frames elapsed during a loop iteration between simulated and real
-            wall_now         = time.perf_counter()
-            wall_tick_secs   = wall_now - next_wall_time
-            wall_tick_frames = int(wall_tick_secs) * frames_per_second
-            next_wall_time   = wall_now
-            now              = max(timestamp(), now + wall_tick_frames)
+            # frames elapsed during a loop iteration between simulated and real.
+            # Use perf_counter_ns for more performant time tracking and calculate the
+            # full elapsed time to avoid accumulating a small error across ticks.
+            wall_now            = time.perf_counter_ns()
+            wall_elapsed_ns     = wall_now - wall_start
+            wall_elapsed_frames = int(wall_elapsed_ns / ns_per_frame)
+            now                 = max(timestamp(), timestamp_start + wall_elapsed_frames)
 
             if now > next_deadline_ts:
                 self._handle_jitter_failure(start_ts, next_ts, frames_per_tick, now, tick)
