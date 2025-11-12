@@ -297,7 +297,8 @@ class BurstDesign:
     def __repr__(self) -> str:
         return f"BurstDesign{tuple(self._args)}"
 
-from .closed_loop import Loop
+from ._closed_loop import Loop, LoopTick
+from ._stim_plan import StimPlan
 from .neurons import Neurons
 
 @contextmanager

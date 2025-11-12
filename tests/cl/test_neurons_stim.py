@@ -4,8 +4,7 @@ import pytest
 from inline_snapshot import snapshot
 
 import cl
-from cl import Neurons, Stim, ChannelSet, StimDesign, BurstDesign
-from cl.stim_plan import StimPlan
+from cl import Neurons, Stim, ChannelSet, StimDesign, BurstDesign, StimPlan
 
 def test_channel_set():
     with pytest.raises(TypeError):

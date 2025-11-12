@@ -19,9 +19,9 @@ from cl import (
     ChannelSet,
     StimDesign,
     BurstDesign,
+    StimPlan,
     _logger
 )
-from cl.stim_plan import StimPlan
 from cl.recording import Recording
 from cl.util import RecordingView, AttributesView, more_accurate_sleep
 from cl.data_stream import DataStream
@@ -408,7 +408,7 @@ class Neurons:
 
     def loop(
         self,
-        ticks_per_second:        int,
+        ticks_per_second:        float,
         stop_after_seconds:      float | None = None,
         stop_after_ticks:        int | None   = None,
         ignore_jitter:           bool         = True, # TODO: set to False when loop timing is fixed
