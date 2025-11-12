@@ -37,7 +37,7 @@ class Loop:
     def __init__(
         self,
         neurons,
-        ticks_per_second:        int,
+        ticks_per_second:        float,
         stop_after_seconds:      float | None = None,
         stop_after_ticks:        int   | None = None,
         ignore_jitter:           bool         = False,
