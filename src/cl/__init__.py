@@ -178,8 +178,8 @@ class StimDesign:
     _DURATION_BIN: int  = 20
     """ (Mock only) Pulse width granularity in microseconds (us). """
 
-    _total_duration_us: float
-    """ (Mock only) Total duration of this stim design. """
+    duration_us: int
+    """ Total duration of this stim design in microseconds (us). """
 
     @overload
     def __init__(
@@ -220,8 +220,8 @@ class StimDesign:
         durations = args[ ::2] # args indices [0, 2, 4]
         currents  = args[1::2] # args indices [1, 3, 5]
         self._validate(durations, currents)
-        self._total_duration_us = sum(durations)
-        self._args              = args
+        self.duration_us = sum(durations)
+        self._args       = args
 
     def _validate(self, durations, currents):
         """ (Mock only) Validate the stim and raise a ValueError if needed. """

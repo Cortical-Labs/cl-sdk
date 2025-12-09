@@ -855,7 +855,7 @@ class Neurons:
         # Specify stimulation constraints
         minimum_lead_time_us      = 80
         lead_time_us_bins         = 40
-        minimum_burst_interval_us = minimum_lead_time_us + stim_design._total_duration_us
+        minimum_burst_interval_us = minimum_lead_time_us + stim_design.duration_us
 
         # Check that stimulation constraints have been met
         if lead_time_us < minimum_lead_time_us:
@@ -868,12 +868,12 @@ class Neurons:
             raise ValueError(
                 f"Burst interval {burst_design._burst_interval_us} us "
                 f"must be at least {minimum_lead_time_us} us "
-                f"+ duration {stim_design._total_duration_us}"
+                f"+ duration {stim_design.duration_us}"
                 )
 
         # burst_interval_frames = burst_design._burst_interval_frames
         burst_interval_frames = int(1 / burst_design._burst_hz * self._frames_per_second)
-        stim_duration_us      = stim_design._total_duration_us
+        stim_duration_us      = stim_design.duration_us
         stim_duration_frames  = int(stim_duration_us / 1e6 * self._frames_per_second)
         lead_time_frames      = int(lead_time_us     / 1e6 * self._frames_per_second)
         next_burst_ts         = from_timestamp
