@@ -70,7 +70,8 @@ class ChannelSet:
     Stores a set of channels for stimulation.
 
     Args:
-        *channels: One or more channels as int provided as constructor arguments.
+        *channels: One or more channels as int provided as separate arguments
+                   or as a sequence of ints.
 
     For example:
 
@@ -88,7 +89,11 @@ class ChannelSet:
         if len(args) < 1:
             raise TypeError("ChannelSet requires at least one channel")
         self._channels = np.zeros(self._CHANNELS_TOTAL, np.bool)
-        for channel in args:
+        if len(args) == 1 and isinstance(args[0], Sequence):
+            channels = args[0]
+        else:
+            channels = args
+        for channel in channels:
             self._add_channels(channel)
 
     def _add_channels(self, channel: int):
