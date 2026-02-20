@@ -3,19 +3,21 @@ set -o errexit
 set -o nounset
 cd "$(dirname "$0")"
 
+source python.sh
+
 echo "Deactivating any active virtual environment..."
 deactivate 2>/dev/null || true
 
 # Create and activate a clean build venv
 rm -rf .venv-build dist
-python3 -m venv .venv-build
+$PYTHON -m venv .venv-build
 source .venv-build/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install --upgrade build
+$PYTHON -m pip install --upgrade pip
+$PYTHON -m pip install --upgrade build
 
 # And build. This recreates dist/*
 rm -rf dist
-python3 -m build
+$PYTHON -m build
 deactivate
 
 # Done. List the files in the tarball.

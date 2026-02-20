@@ -298,7 +298,7 @@ class Loop:
                     self._jitter_recovery_callback(tick)
                 # else: skip tick to allow loop to catch up
 
-            elif not loop_is_late:
+            else:
                 # Normal operation - yield tick
                 yield tick
 
