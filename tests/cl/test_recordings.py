@@ -11,11 +11,11 @@ from inline_snapshot import snapshot
 
 import cl
 from cl import ChannelSet, StimDesign
-from cl.recording import utcdatestring
+from cl.recording import _utcdatestring
 from cl.util import RecordingView, AttributesView
 
 def test_recording(mocker: MockerFixture, tmp_path: Path):
-    os.environ["CL_MOCK_ACCELERATED_TIME"] = "1"
+    os.environ["CL_SDK_ACCELERATED_TIME"] = "1"
 
     # Fix the datetime since the output file depends on it
     mock_datetime = mocker.patch("cl.recording.datetime")
@@ -25,7 +25,7 @@ def test_recording(mocker: MockerFixture, tmp_path: Path):
     duration_sec = 20.0
     with cl.open() as neurons:
         neurons._elapsed_frames = 0
-        
+
         recording = neurons.record(file_location=str(tmp_path))
         timestamp = recording.start_timestamp
 
@@ -55,7 +55,7 @@ def test_recording(mocker: MockerFixture, tmp_path: Path):
         recording.wait_until_stopped()
 
     # Check that the recording was created successfully
-    expected_fname_prefix  = utcdatestring(mock_datetime.now())
+    expected_fname_prefix  = _utcdatestring(mock_datetime.now())
     expected_fname_postfix = "recording"
     expected_fname         = f"{expected_fname_prefix}_{expected_fname_postfix}.h5"
     expected_fpath         = tmp_path / expected_fname
@@ -145,3 +145,24 @@ def test_recording(mocker: MockerFixture, tmp_path: Path):
             assert np.allclose(actual, expected)
         else:
             assert actual == expected
+
+def test_recording_frame_correctness():
+    """ Tests that neurons.read() is accurate, especially with wrapping replay file. """
+    os.environ["CL_SDK_ACCELERATED_TIME"]    = "1"
+    os.environ["CL_SDK_REPLAY_START_OFFSET"] = "0"
+    with cl.open() as neurons:
+        replay_duration = neurons._duration_frames
+        replay_samples  = neurons._replay_file.samples
+        start_ts        = neurons._start_timestamp
+        wrap_times      = 2
+        # Read from start_timestamp explicitly to align with replay_offset
+        frames          = neurons.read(replay_duration * wrap_times, start_ts)
+        step            = 100
+
+        assert replay_samples is not None
+        assert frames.shape[0] == replay_samples.shape[0] * wrap_times
+
+        for i in range(0, frames.shape[0], step):
+            t = (i + neurons._replay_start_offset) % replay_duration
+            assert np.allclose(replay_samples[t : t+step, :], frames[i : i + step, :]), f"{frames.shape[0]=} {i=}, {t=}"
+        print("Pass!")

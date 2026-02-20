@@ -1,0 +1,335 @@
+{# This is a copy of default/module.html.jinja with the following modifications:
+    - moved module name from top of the page (block module_info) to just before API class definitions (block module_contents)
+#}
+{% extends "frame.html.jinja2" %}
+{% block head %}
+    {{ super() }}
+    <script src="/doc-handler.js"></script>
+{% endblock %}
+{% block title %}{{ module.modulename }} API documentation{% endblock %}
+{% block nav %}
+    {% block module_list_link %}
+        {% set parentmodule = ".".join(module.modulename.split(".")[:-1]) %}
+        {% if parentmodule and parentmodule in all_modules %}
+            <a class="pdoc-button module-list-button" href="../{{ parentmodule.split(".")[-1] }}.html">
+                {% include "resources/box-arrow-in-left.svg" %}
+                &nbsp;
+                {{- parentmodule -}}
+            </a>
+        {% elif not root_module_name %}
+            <a class="pdoc-button module-list-button" href="{{ "../" * module.modulename.count(".") }}index.html">
+                {% include "resources/box-arrow-in-left.svg" %}
+                &nbsp;
+                Developer Guide
+            </a>
+        {% endif %}
+    {% endblock %}
+
+    {% block nav_title %}
+        {% if logo %}
+            {% if logo_link %}<a href="{{ logo_link }}">{% endif %}
+            <img src="{{ logo }}" class="logo" alt="project logo"/>
+            {% if logo_link %}</a>{% endif %}
+        {% endif %}
+    {% endblock %}
+
+    {% block search_box %}
+        {% if search and all_modules|length > 1 %}
+            {# we set a pattern here so that we can use the :valid CSS selector #}
+            <input type="search" placeholder="Search..." role="searchbox" aria-label="search"
+                   pattern=".+" required>
+        {% endif %}
+    {% endblock %}
+
+    {% block nav_index %}
+        {% set index = module.docstring | to_markdown | to_html | attr("toc_html") %}
+        {% if index %}
+            <h2>Contents</h2>
+            {{ index | safe }}
+        {% endif %}
+    {% endblock %}
+
+    {% block nav_members %}
+        {% if module.members %}
+            <h2>API Documentation</h2>
+            {{ nav_members(module.members.values()) }}
+        {% endif %}
+    {% endblock %}
+
+    <h2 class="module-list-heading">Modules</h2>
+
+    {% macro render_modules(tree, prefix="", depth=0) %}
+        {% for name, subtree in tree.items() %}
+            {% set full_name = (prefix + "." + name) if prefix else name %}
+            {% set url = "/" + "/".join(full_name.split(".")) + ".html" %}
+            <li style="padding-left: {{ depth * 1.5 }}em">
+                {% if full_name == module.modulename %}
+                    <strong>{{ full_name }}</strong>
+                {% else %}
+                    <a href="{{ url }}">{{ full_name }}</a>
+                {% endif %}
+            </li>
+            {% if subtree %}{{ render_modules(subtree, full_name, depth + 1) }}{% endif %}
+        {% endfor %}
+    {% endmacro %}
+
+    <ul>{{ render_modules(build_module_tree(all_modules)) }}</ul>
+
+    {% block nav_footer %}
+        {% if footer_text %}
+            <footer>{{ footer_text }}</footer>
+        {% endif %}
+    {% endblock %}
+
+    {% block attribution %}
+        <a class="attribution" title="pdoc: Python API documentation generator" href="https://pdoc.dev" target="_blank">
+            built with <span class="visually-hidden">pdoc</span><img
+                alt="pdoc logo"
+                src="data:image/svg+xml,
+                        {%- filter urlencode %}{% include "resources/pdoc-logo.svg" %}{% endfilter %}"/>
+        </a>
+    {% endblock %}
+{% endblock nav %}
+{% block content %}
+    <main class="pdoc">
+        {% block module_info %}
+            <section class="module-info">
+                {% block edit_button %}
+                    {% if edit_url %}
+                        {% if "github.com" in edit_url %}
+                            {% set edit_text = "Edit on GitHub" %}
+                        {% elif "gitlab" in edit_url %}
+                            {% set edit_text = "Edit on GitLab" %}
+                        {% else %}
+                            {% set edit_text = "Edit Source" %}
+                        {% endif %}
+                        <a class="pdoc-button git-button" href="{{ edit_url }}">{{ edit_text }}</a>
+                    {% endif %}
+                {% endblock %}
+                {{ docstring(module) }}
+                {{ view_source_state(module) }}
+                {{ view_source_button(module) }}
+                {{ view_source_code(module) }}
+            </section>
+        {% endblock %}
+        {% block module_contents %}
+            {{ module_name() }}
+            {% for m in module.flattened_own_members if is_public(m) | trim %}
+                <section id="{{ m.qualname or m.name }}">
+                    {{ member(m) }}
+                    {% if m.kind == "class" %}
+                        {% for m in m.own_members if m.kind != "class" and is_public(m) | trim %}
+                            <div id="{{ m.qualname }}" class="classattr">
+                                {{ member(m) }}
+                            </div>
+                        {% endfor %}
+                        {% set inherited_members = inherited(m) | trim %}
+                        {% if inherited_members %}
+                            <div class="inherited">
+                                <h5>Inherited Members</h5>
+                                <dl>
+                                    {{ inherited_members }}
+                                </dl>
+                            </div>
+                        {% endif %}
+                    {% endif %}
+                </section>
+            {% endfor %}
+        {% endblock %}
+    </main>
+    {% if mtime %}
+        {% include "livereload.html.jinja2" %}
+    {% endif %}
+    {% block search_js %}
+        {% if search and all_modules|length > 1 %}
+            {% include "search.html.jinja2" %}
+        {% endif %}
+    {% endblock %}
+{% endblock content %}
+{#
+End of content, beginning of helper macros.
+See https://pdoc.dev/docs/pdoc/render_helpers.html#DefaultMacroExtension for an explanation of defaultmacro.
+#}
+{% defaultmacro bases(cls) %}
+    {%- if cls.bases -%}
+        <wbr>(
+        {%- for base in cls.bases -%}
+            <span class="base">{{ base[:2] | link(text=base[2]) }}</span>
+            {%- if loop.nextitem %}, {% endif %}
+        {%- endfor -%}
+        )
+    {%- endif -%}
+{% enddefaultmacro %}
+{% defaultmacro default_value(var) -%}
+    {%- if var.default_value_str %}
+        =
+        {% if var.default_value_str | length > 100 -%}
+            <input id="{{ var.qualname }}-view-value" class="view-value-toggle-state" type="checkbox" aria-hidden="true" tabindex="-1">
+            <label class="view-value-button pdoc-button" for="{{ var.qualname }}-view-value"></label>
+        {%- endif -%}
+        <span class="default_value">{{ var.default_value_str | escape | linkify }}</span>
+    {%- endif -%}
+{% enddefaultmacro %}
+{% defaultmacro annotation(var) %}
+    {%- if var.annotation_str -%}
+        <span class="annotation">{{ var.annotation_str | escape | linkify }}</span>
+    {%- endif -%}
+{% enddefaultmacro %}
+{% defaultmacro decorators(doc) %}
+    {% for d in doc.decorators if not d.startswith("@_") %}
+        <div class="decorator decorator-{{ d[1:].partition("(")[0] }}">{{ d }}</div>
+    {% endfor %}
+{% enddefaultmacro %}
+{% defaultmacro function(fn) -%}
+    {{ decorators(fn) }}
+    {% if fn.name == "__init__" %}
+        <span class="name">{{ ".".join(fn.qualname.split(".")[:-1]) }}</span>
+        {{- fn.signature_without_self | format_signature(colon=False) | linkify }}
+    {% else %}
+        <span class="def">{{ fn.funcdef }}</span>
+        <span class="name">{{ fn.name }}</span>
+        {{- fn.signature | format_signature(colon=True) | linkify }}
+    {% endif %}
+{% enddefaultmacro %}
+{% defaultmacro variable(var) -%}
+    {%- if var.is_type_alias_type %}<span class="def">type</span> {% endif -%}
+    <span class="name">{{ var.name }}</span>{{ annotation(var) }}{{ default_value(var) }}
+{% enddefaultmacro %}
+{% defaultmacro submodule(mod) -%}
+    <span class="name">{{ mod.taken_from | link }}</span>
+{% enddefaultmacro %}
+{% defaultmacro class(cls) -%}
+    {{ decorators(cls) }}
+    <span class="def">class</span>
+    <span class="name">{{ cls.qualname }}</span>
+    {{- bases(cls) -}}:
+{% enddefaultmacro %}
+{% defaultmacro member(doc) %}
+    {{- view_source_state(doc) -}}
+    <div class="attr {{ doc.kind }}">
+        {% if doc.kind == "class" %}
+            {{ class(doc) }}
+        {% elif doc.kind == "function" %}
+            {{ function(doc) }}
+        {% elif doc.kind == "module" %}
+            {{ submodule(doc) }}
+        {% else %}
+            {{ variable(doc) }}
+        {% endif %}
+        {{ view_source_button(doc) }}
+    </div>
+    <a class="headerlink" href="#{{ doc.qualname or doc.name }}"></a>
+    {{ view_source_code(doc) }}
+    {{ docstring(doc) }}
+{% enddefaultmacro %}
+{% defaultmacro docstring(var) %}
+    {% if var.docstring %}
+        <div class="docstring">{{ var.docstring | replace("@public", "") | to_markdown | to_html | linkify(namespace=var.qualname, shorten=False) }}</div>
+    {% endif %}
+{% enddefaultmacro %}
+{% defaultmacro nav_members(members) %}
+    <ul class="memberlist">
+        {% for m in members if is_public(m) | trim %}
+            <li>
+                {% if m.kind == "class" %}
+                    <a class="class" href="#{{ m.qualname }}">{{ m.qualname }}</a>
+                    {% if m.own_members %}
+                        {{ nav_members(m.own_members) | indent(12) }}
+                    {% endif %}
+                {% elif m.kind == "module" %}
+                    <a class="module" href="#{{ m.name }}">{{ m.name }}</a>
+                {% elif m.name == "__init__" %}
+                    <a class="function" href="#{{ m.qualname }}">{{ m.qualname.split(".")[-2] }}</a>
+                {% else %}
+                    <a class="{{ m.kind }}" href="#{{ m.qualname }}">{{ m.name }}</a>
+                {% endif %}
+            </li>
+        {% endfor %}
+    </ul>
+{% enddefaultmacro %}
+{% defaultmacro is_public(doc) %}
+    {#
+    This macro is a bit unconventional in that its output is not rendered, but treated as a boolean:
+    Returning no text is interpreted as false, returning any other text is iterpreted as true.
+    Implementing this as a macro makes it very easy to override with a custom template, see
+    https://github.com/mitmproxy/pdoc/tree/main/examples/custom-template.
+    #}
+    {% if "@private" in doc.docstring %}
+        {# hide members explicitly marked as @private #}
+    {% elif "@public" in doc.docstring %}
+        {# show members explicitly marked as @public #}
+        true
+    {% elif not include_undocumented and not doc.docstring and doc.kind != "module" %}
+        {# hide members that are undocumented if include_undocumented has been toggled off. #}
+    {% elif doc.name == "__init__" and (doc.docstring or (doc.kind == "function" and doc.signature_without_self.parameters)) %}
+        {# show constructors that have a docstring or at least one extra argument #}
+        true
+    {% elif doc.name == "__doc__" %}
+        {# We don't want to document __doc__ itself, https://github.com/mitmproxy/pdoc/issues/235 #}
+    {% elif doc.kind == "variable" and doc.is_typevar and not doc.docstring %}
+        {# do not document TypeVars, that only clutters the docs. #}
+    {% elif doc.kind == "module" and doc.fullname not in all_modules %}
+        {# Skip modules that were manually excluded, https://github.com/mitmproxy/pdoc/issues/334 #}
+    {% elif (doc.qualname or doc.name) is in(module.obj.__all__ or []) %}
+        {# members starting with an underscore are still public if mentioned in __all__ #}
+        true
+    {% elif not doc.name.startswith("_") %}
+        {# members not starting with an underscore are considered public by default #}
+        true
+    {% endif %}
+{% enddefaultmacro %}
+{# fmt: off #}
+{% defaultmacro inherited(cls) %}
+    {% for base, members in cls.inherited_members.items() %}
+        {% if base[0] not in all_modules %}
+            {# hide inherited members from modules that are not in the documentation, https://github.com/mitmproxy/pdoc/issues/715 #}
+            {% continue %}
+        {% endif %}
+        {% set m = None %}{# workaround for https://github.com/pallets/jinja/issues/1427 #}
+        {% set member_html %}
+            {% for m in members if is_public(m) | trim %}
+                <dd id="{{ m.qualname }}" class="{{ m.kind }}">
+                    {{- m.taken_from | link(text=m.name.replace("__init__",base[1])) -}}
+                </dd>
+            {% endfor %}
+        {% endset %}
+        {# we may not have any public members, in which case we don't want to print anything. #}
+        {% if member_html %}
+            <div><dt>{{ base | link }}</dt>
+                {{ member_html }}
+            </div>
+        {% endif %}
+    {% endfor %}
+{% enddefaultmacro %}
+{# fmt: on #}
+{% defaultmacro view_source_state(doc) %}
+    {% if show_source and doc.source %}
+        <input id="{{ doc.qualname or "mod-" + doc.name }}-view-source" class="view-source-toggle-state" type="checkbox" aria-hidden="true" tabindex="-1">
+    {% endif %}
+{% enddefaultmacro %}
+{% defaultmacro view_source_button(doc) %}
+    {% if show_source and doc.source %}
+        <label class="view-source-button" for="{{ doc.qualname or "mod-" + doc.name }}-view-source"><span>View Source</span></label>
+    {% endif %}
+{% enddefaultmacro %}
+{% defaultmacro view_source_code(doc) %}
+    {% if show_source and doc.source %}
+        {{ doc | highlight }}
+    {% endif %}
+{% enddefaultmacro %}
+{% defaultmacro module_name() %}
+    <h1 class="modulename">
+        {% set parts = module.modulename.split(".") %}
+        {% for part in parts %}
+            {%- set fullname = ".".join(parts[:loop.index]) -%}
+            {%- if fullname in all_modules and fullname != module.modulename -%}
+                <a href="./{{ "../" * loop.revindex0 }}{{ part }}.html">{{ part }}</a>
+            {%- else -%}
+                {{ part }}
+            {%- endif -%}
+            {%- if loop.nextitem -%}
+                <wbr>.
+            {%- endif -%}
+        {% endfor %}
+    </h1>
+{% enddefaultmacro %}

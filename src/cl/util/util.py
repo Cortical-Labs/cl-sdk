@@ -1,7 +1,11 @@
+import os
 import time
+
 import numpy as np
 import msgpack
 import msgpack_numpy
+import functools
+import contextlib
 
 #
 # Misc utilities
@@ -183,12 +187,12 @@ def benchmark_disable():
     _benchmark_enabled = False
 
 class Benchmark:
-    """ A utility to measure code execution time. """
-
     def __init__(self, name: str = "Benchmark", report_threshold_us: int = 0):
         """
+        A utility to measure code execution time.
+
         Args:
-            name: Benchmark name.
+            name:                Benchmark name.
             report_threshold_us: Print code execution time if threshold is exceeded.
         """
         self.name                = name
@@ -207,19 +211,14 @@ class Benchmark:
                 duration_us = duration_ns / 1000.0
                 print(f"{self.name}: took {duration_us:.3f} µs")
 
-def more_accurate_sleep(seconds):
-    """
-    Attempt a more accurate sleep by wasting CPU
-    """
-    end = time.perf_counter() + seconds
-    # if seconds > 0.1:
-    #     time.sleep(seconds - 0.1)
-    while time.perf_counter() < end:
-        pass
+#
+# Deprecation warnings
+#
 
 def deprecated(replacement=None):
     """ Decorator that marks a method as deprecated, and prints a warning on first use. """
     def decorator(method):
+        @functools.wraps(method) # Required to expose method signature like __doc__
         def wrapper(*args, **kwargs):
             if not hasattr(method, '_warned_deprecation'):
                 if replacement:
@@ -230,3 +229,72 @@ def deprecated(replacement=None):
             return method(*args, **kwargs)
         return wrapper
     return decorator
+
+def in_ipython():
+    try:
+        # get_ipython is defined by IPython; if not, this will raise NameError
+        ipy = get_ipython()
+        return ipy is not None
+    except NameError:
+        return False
+
+def in_vscode():
+    """Returns True if running inside VSCode's Jupyter environment."""
+    return in_ipython() and "VSCODE_CWD" in os.environ
+
+#
+# Security patches for Pickle
+# This is needed since PyTables natively use pickle to handle dict within attributes
+#
+
+class BlockedUnpicklingError(Exception):
+    pass
+
+@contextlib.contextmanager
+def builtins_only_unpickling():
+    """
+    Monkey patch pickle.loads to block unpickling of non-builtin types when unpickling data.
+    This is a security measure to prevent potential code execution from maliciously crafted pickle data.
+    """
+    import io
+    import pickle
+    try:
+        import _pickle
+    except ImportError:
+        _pickle = None
+
+    # Backup original pickle.loads and _pickle.loads (if it exists) so we can restore them later
+    old_pickle_loads    = pickle.loads
+    old_Unpickler       = pickle.Unpickler
+    old_c_loads         = getattr(_pickle, "loads", None) if _pickle else None
+
+    # Flag to track if we encountered any unsafe pickle data during loading
+    blocked_type_attempted = False
+
+    class BuiltinsOnlyUnpickler(old_Unpickler):
+        def find_class(self, module, name):
+            nonlocal blocked_type_attempted
+            blocked_type_attempted = True
+            raise BlockedUnpicklingError()
+
+    def _restricted_pickle_loads(data, /, **kwargs):
+        return BuiltinsOnlyUnpickler(io.BytesIO(data)).load()
+
+    # Monkey patch pickle.loads and _pickle.loads (if it exists) to our restricted version
+    pickle.loads     = _restricted_pickle_loads
+    pickle.Unpickler = BuiltinsOnlyUnpickler
+    if _pickle and hasattr(_pickle, "loads"):
+        _pickle.loads = _restricted_pickle_loads
+
+    try:
+        # Enter the context where unpickling is restricted to builtin types only.
+        yield
+        # After the block, if we attempted to unpickle any non-builtin types, raise an error to alert the caller.
+        if blocked_type_attempted:
+            raise BlockedUnpicklingError("Potenitally unsafe pickle data was blocked during unpickling.")
+    finally:
+        # Restore original pickle loading functions
+        pickle.loads     = old_pickle_loads
+        pickle.Unpickler = old_Unpickler
+        if _pickle and old_c_loads is not None:
+            _pickle.loads = old_c_loads

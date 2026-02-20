@@ -20,7 +20,14 @@ dependencies = [
     "msgpack_numpy",
     "tables",
     "dotenv",
-    "matplotlib"
+    "matplotlib",
+    "pydantic",
+    "scipy",
+    "networkx",
+    "python-louvain",
+    "pandas",
+    "websockets",
+    "ipykernel"
 ]
 
 [project.optional-dependencies]
@@ -28,7 +35,7 @@ test = [
     "pytest",
     "pytest_mock",
     "inline_snapshot[black]",
-    "matplotlib"
+    "pdoc"
 ]
 
 [project.urls]
