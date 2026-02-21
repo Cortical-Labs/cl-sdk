@@ -1,19 +1,12 @@
-# Cortical Labs Mock API
+# CL SDK
 
-*** EARLY ACCESS RELEASE ***
+This package provides an implementation of the CL API to assist with local development of applications that can run on a Cortical Labs CL1 system.
 
-This package provides a mock cl API to assist with local development of applications that can run on a Cortical Labs CL1 system.
+Please refer to [https://docs.corticallabs.com] for the latest documentation.
 
-The following key features are implemented:
+## Prerequisites
 
-- Simulation of spikes and waveforms
-- Stimulation (`neurons.stim(...)`, `neurons.create_stim_plan()`)
-- Time based code execution (`neurons.loop(...)`)
-- Recording (`neurons.record(...)`)
-
-Planned for future versions:
-
-- Real-time visualisation of live data
+This SDK requires Python 3.12 or later.
 
 ## Installation
 
@@ -26,7 +19,7 @@ $ pip3 install cl-sdk
 
 ## Cortical Labs Developer Guide
 
-The mock API is capable of running most of the Jupyter notebooks in our developer guide. Install cl-sdk as above, then:
+This SDK is capable of running most of the Jupyter notebooks in our developer guide. Install cl-sdk as above, then:
 
 ```bash
 $ git clone https://github.com/Cortical-Labs/cl-api-doc.git
@@ -54,11 +47,18 @@ $ pip3 install -e '.[test]'
 $ pytest
 ```
 
-## Needs Fixing
+### Building Documentation
 
-### Loop timing
+```bash
+$ pip3 install -e '.[test]'
+$ python3 -m docs.make
+```
 
-Currently, loop ticks will read the requisite number of frames. When using wall clock mode, this will block for the actual duration of the tick, which may cause a jitter error to be thrown as it leaves very little margin for executing the user's code for each tick.
+Serve the built docs to view in a browser:
+
+```bash
+$ python3 -m http.server -d docs/html
+```
 
 ## User Options
 
@@ -66,16 +66,22 @@ Several user options can be set by defining environment variables in a `.env` fi
 
 ### Simulation from a recording
 
-The Mock API simulates spikes and samples by replaying recordings as set by the `CL_MOCK_REPLAY_PATH` environment variable in the `.env` file. If this is omitted, a temporary recording with randomly generated samples and spikes will be used that is based on a Poisson distribution and the following optional environment variables:
-- `CL_MOCK_SAMPLE_MEAN`: Mean samples value (default 170). This value will be in microvolts when multiplied by the constant "uV_per_sample_unit" in the recording attributes;
-- `CL_MOCK_SPIKE_PERCENTILE`: Percentile threshold for sample values, above which will correspond to a spike (default 99.995);
-- `CL_MOCK_DURATION_SEC`: Duration of the temporary recording (default 60); and
-- `CL_MOCK_RANDOM_SEED`: Random seed (defaults to Unix time).
+Spikes and samples are simulated by replaying recordings as set by the `CL_SDK_REPLAY_PATH` environment variable in the `.env` file. If this is omitted, a temporary recording with randomly generated samples and spikes will be used that is based on a Poisson distribution and the following optional environment variables:
+- `CL_SDK_SAMPLE_MEAN`: Mean samples value (default 170). This value will be in microvolts when multiplied by the constant "uV_per_sample_unit" in the recording attributes;
+- `CL_SDK_SPIKE_PERCENTILE`: Percentile threshold for sample values, above which will correspond to a spike (default 99.995);
+- `CL_SDK_DURATION_SEC`: Duration of the temporary recording (default 60); and
+- `CL_SDK_RANDOM_SEED`: Random seed (defaults to Unix time).
+
+The starting position of the replay recording will be randomised every time `cl.open()` is called. This can be overriden by setting `CL_SDK_REPLAY_START_OFFSET`, where a value of `0` indicates the first frame of the recording.
 
 ### Speed of simulation
 
-The Mock API can operate in two timing modes:
+The simulator can operate in two timing modes:
 - Based on wall clock time (default), or
 - Accelerated time.
 
-Accelerated time mode can be enabled by setting `CL_MOCK_ACCELERATED_TIME=1` environment variable in the `.env` file. When enabled, passage of time will be decouple from the system wall clock time, enabling accelerated testing of applications.
+Accelerated time mode can be enabled by setting `CL_SDK_ACCELERATED_TIME=1` environment variable in the `.env` file. When enabled, passage of time will be decouple from the system wall clock time, enabling accelerated testing of applications.
+
+### WebSocket server
+
+An included webSocket server can be used to stream simulated data. By default, the server is disabled. It can be enabled by setting `CL_SDK_WEBSOCKET=1` environment variable in the `.env` file. The port used by the server can be set using the `CL_SDK_WEBSOCKET_PORT` environment variable (default 1025). The server will be hosted on `localhost` by default, but this can be changed by setting the `CL_SDK_WEBSOCKET_HOST` environment variable.

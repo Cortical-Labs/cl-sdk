@@ -1,0 +1,498 @@
+:root {
+    --font-small: 13px;
+    --font-medium: 15px;
+    --font-large: 17px;
+    --button-height: 34px;
+    --link-color: #51688c;
+    --link-hover-color: #4168b1;
+    --link-visited-color: #51688c;
+    --green-color: #0a5;
+}
+
+form {
+    position: relative;
+}
+
+.single-field form {
+    display: flex;
+    gap: 5px;
+}
+
+.single-field form input[type="text"],
+.single-field form input[type="number"] {
+    padding-top: 0;
+    padding-bottom: 0;
+    font-size: var(--font-small);
+}
+
+.single-field form input[type="text"].invalid,
+.single-field form input[type="number"].invalid {
+    border-color: #f53;
+}
+
+.single-field .form-error:not(:empty) {
+    margin-top: 5px;
+    color: #f53;
+}
+
+.form-error:not(:empty) {
+    margin-top: 5px;
+    color: #f53;
+    font-size: var(--font-small);
+}
+
+form input[type="text"],
+form input[type="number"] {
+    width: 100%;
+    padding: 10px;
+    padding-left: 15px;
+    border: 1px solid #E3E5E2;
+    border-radius: 8px;
+    font-size: var(--font-medium);
+    font-weight: 500;
+    background-color: #FFF;
+    color: #000;
+}
+
+form input[type="text"].transparent,
+form input[type="number"].transparent {
+    background-color: rgba(0, 0, 0, 0.06);
+    border-color: rgba(0, 0, 0, 0.1);
+}
+
+form input[type="text"]::placeholder,
+form input[type="number"]::placeholder {
+    color: #9B9D98;
+}
+
+form input[type="text"]:focus,
+form input[type="number"]:focus {
+    outline: none;
+    border-color: #000;
+}
+
+form input.invalid,
+form input.invalid:focus {
+    border-color: #f53;
+}
+
+form input[type="text"]:disabled,
+form input[type="number"]:disabled {
+    opacity: 0.5;
+    pointer-events: none;
+    cursor: not-allowed;
+}
+
+.field-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.field-row:first-child:last-child button {
+    display: none;
+}
+
+.field-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+form .bottom-right {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+}
+
+.toggle {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+}
+
+.toggle:has(input:disabled) {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.toggle>input {
+    opacity: 0;
+    pointer-events: none;
+    position: absolute;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.toggle>.bg {
+    --w: 50px;
+    --h: calc(var(--w) / 2);
+    --col: #9B9D98;
+    width: var(--w);
+    height: var(--h);
+    border-radius: var(--h);
+    border: 2px solid var(--col);
+    background-color: var(--col);
+}
+
+.toggle:active>.bg,
+.toggle:hover>.bg {
+    transition-duration: 0.1s;
+    transition-property: background-color, border-color;
+}
+
+.toggle:has(input:disabled)>.bg {
+    --col: #E3E5E2;
+    background-color: #F5F5F5;
+    border-color: var(--col);
+}
+
+.toggle:hover>.bg {
+    --col: #bbb;
+    /* transition-duration: 0s !important;
+    transition: none !important; */
+    /* background-color: var(--col);
+    border: 2px solid var(--col); */
+}
+
+.toggle:has(input:disabled):hover>.bg {
+    --col: #E3E5E2;
+    background-color: #F5F5F5;
+    border-color: var(--col);
+}
+
+.toggle:has(input:disabled):hover>input:checked~.bg {
+    --col: #083;
+    background-color: var(--col);
+    border-color: var(--col);
+}
+
+.toggle>.text::after {
+    content: "Disabled";
+}
+
+.toggle>input:checked~.text::after {
+    content: "Enabled";
+}
+
+.toggle>input:disabled~.text::after {
+    content: "";
+    color: #9B9D98;
+}
+
+.toggle>.bg>.fg {
+    width: 50%;
+    height: 100%;
+    background-color: #FFF;
+    border-radius: var(--h);
+}
+
+.toggle:active>.bg>.fg,
+.toggle:hover>.bg>.fg {
+    transition-duration: 0.2s;
+    transition-property: transform;
+}
+
+.toggle>input:checked~.bg {
+    --col: #083;
+    background-color: var(--col);
+    border-color: var(--col);
+}
+
+.toggle>input:checked~.bg>.fg {
+    transform: translateX(100%);
+}
+
+.toggle:has(input:disabled)>.bg>.fg {
+    background-color: #CCC;
+}
+
+.button {
+    border: 0;
+    display: flex;
+    align-items: center;
+    background-color: transparent;
+    cursor: pointer;
+    text-decoration: none;
+}
+
+.button.primary,
+.button.secondary,
+.button.dangerous,
+.button.icon-only {
+    height: var(--button-height);
+    border-radius: 8px;
+}
+
+.button.primary,
+.button.secondary {
+    padding: 0 15px;
+    gap: 8px;
+}
+
+.button.primary:not(.natural-width),
+.button.secondary:not(.natural-width) {
+    min-width: 256px;
+    width: max-content;
+}
+
+.button.primary {
+    background-color: #000;
+    color: #FFF;
+}
+
+.button.primary:hover:enabled {
+    background-color: rgba(0, 0, 0, 0.8);
+}
+
+.button.secondary {
+    background-color: rgba(0, 0, 0, 0.06);
+    color: #000;
+}
+
+.button.secondary:hover {
+    background-color: rgba(0, 0, 0, 0.1);
+}
+
+.button:disabled {
+    background-color: rgba(0, 0, 0, 0.1);
+    color: #9B9D98 !important;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+button {
+    border: 0;
+    align-items: center;
+    justify-content: center;
+    background-color: transparent;
+    cursor: pointer;
+    color: var(--text-color);
+}
+
+button.primary,
+button.secondary,
+button.dangerous,
+button.icon-only {
+    display: flex;
+    height: var(--button-height);
+    border-radius: 8px;
+}
+
+button.primary,
+button.secondary button.dangerous {
+    padding: 0 15px;
+    gap: 8px;
+}
+
+button.primary:not(.natural-width),
+button.secondary:not(.natural-width),
+button.dangerous:not(.natural-width) {
+    min-width: 100px;
+}
+
+button.primary {
+    background-color: #000;
+    color: #FFF;
+}
+
+button.primary:hover:enabled {
+    background-color: rgba(0, 0, 0, 0.8);
+}
+
+button.secondary {
+    background-color: rgba(0, 0, 0, 0.06);
+    color: #000;
+}
+
+button.secondary:hover:enabled {
+    background-color: rgba(0, 0, 0, 0.1);
+}
+
+button.dangerous {
+    background-color: #e34;
+    color: #fff;
+}
+
+button.dangerous:hover:enabled {
+    background-color: #f53;
+    color: #fff;
+}
+
+
+button.icon-only {
+    width: var(--button-height);
+}
+
+button.icon-only.subtle {
+    color: #9B9D98;
+}
+
+button.icon-only:hover {
+    background-color: rgba(0, 0, 0, 0.06);
+    color: #000;
+}
+
+button.editable {
+    width: 100%;
+    font-size: var(--font-small);
+    font-weight: 700;
+    justify-content: space-between;
+    height: var(--button-height);
+    padding: 0 15px;
+    background-color: rgba(0, 0, 0, 0.06);
+    color: #000;
+    border-radius: 8px;
+    cursor: pointer;
+    display: flex;
+}
+
+button.editable:hover:enabled {
+    background-color: rgba(0, 0, 0, 0.1);
+}
+
+button.editable.success,
+button.editable.success:hover:enabled {
+    animation-name: success;
+    animation-duration: 1.5s;
+}
+
+form button {
+    color: var(--text-color);
+}
+
+.hidden {
+    display: none !important;
+}
+
+@keyframes success {
+    from {
+        box-shadow: inset 0 0 0 50px #3c6f;
+    }
+
+    to {
+        box-shadow: inset 0 0 0 50px #3c60;
+    }
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --link-color: #7fa8d4;
+        --link-hover-color: #9bc2ed;
+        --link-visited-color: #7fa8d4;
+        --green-color: #4CAF50;
+    }
+
+    form input[type="text"],
+    form input[type="number"] {
+        background-color: #2a2a2a;
+        border-color: #3a3a3a;
+        color: #e0e0e0;
+    }
+
+    form input[type="text"].transparent,
+    form input[type="number"].transparent {
+        background-color: rgba(255, 255, 255, 0.06);
+        border-color: rgba(255, 255, 255, 0.1);
+    }
+
+    form input[type="text"]::placeholder,
+    form input[type="number"]::placeholder {
+        color: #666;
+    }
+
+    form input[type="text"]:focus,
+    form input[type="number"]:focus {
+        border-color: #e0e0e0;
+    }
+
+    .toggle>.bg {
+        --col: #666;
+    }
+
+    .toggle:hover>.bg {
+        --col: #888;
+    }
+
+    .toggle>input:checked~.bg {
+        --col: var(--green-color);
+    }
+
+    .toggle:has(input:disabled)>.bg {
+        --col: #3a3a3a;
+        background-color: #2a2a2a;
+    }
+
+    .toggle:has(input:disabled):hover>input:checked~.bg {
+        --col: var(--green-color);
+    }
+
+    .toggle>input:disabled~.text::after {
+        color: #666;
+    }
+
+    .button.primary {
+        background-color: #e0e0e0;
+        color: #000;
+    }
+
+    .button.primary:hover:enabled {
+        background-color: #fff;
+    }
+
+    .button.secondary {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: #e0e0e0;
+    }
+
+    .button.secondary:hover {
+        background-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .button:disabled {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: #666 !important;
+    }
+
+    button.primary {
+        background-color: #e0e0e0;
+        color: #000;
+    }
+
+    button.primary:hover:enabled {
+        background-color: #fff;
+    }
+
+    button.secondary {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: #e0e0e0;
+    }
+
+    button.secondary:hover:enabled {
+        background-color: rgba(255, 255, 255, 0.15);
+    }
+
+    button.icon-only.subtle {
+        color: #666;
+    }
+
+    button.icon-only:hover {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: #e0e0e0;
+    }
+
+    button.editable {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: #e0e0e0;
+    }
+
+    button.editable:hover:enabled {
+        background-color: rgba(255, 255, 255, 0.15);
+    }
+}

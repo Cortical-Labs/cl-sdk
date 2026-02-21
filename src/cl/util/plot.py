@@ -4,12 +4,14 @@ import matplotlib.ticker as ticker
 import numpy as np
 from numpy import ndarray
 
-from cl import Spike
+from .. import Spike
+from .util import deprecated
 
 def uV_formatter(value, pos) -> str:
     """ A function to be passed to matplotlib.ticker.FuncFormatter to format value as microvolts. """
     return f"{value} µV"
 
+@deprecated("RecordingView.plot_spike()")
 def plot_spike(spike: tuple[int, int, ndarray] | Spike):
     """ Creates a plot of a single spike.
 

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <meta name="HandheldFriendly" content="true" />
+    <link rel="stylesheet" href="/visualiser/form.css">
+    <link rel="stylesheet" href="/visualiser/style.css">
+    <script type="module" src="/visualiser/form.mjs"></script>
+    <style>
+
+        :root {
+            --page-colour: #000;
+            --page-background-colour: #ffffff;
+            --page-background-colour-alt: #ffffff;
+            --grid-colour: #ddd;
+            --electrode-background-colour: #fff;
+            --electrode-min-max-colour: #4c4c4c;
+            --electrode-3d-min-max-colour: #cbcbcb;
+            --electrode-3d-cell-outline-colour: #cccccc;
+            --electrode-spike-indicator-colour: #000000;
+            --electrode-spike-fill-colour: #78ff5e;
+            --electrode-spike-flash-colour: #ddd;
+            --electrode-stim-colour: #000000;
+            --electrode-stim-fill-colour: #41ffff;
+            --canvas-3d-filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.2));
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --page-colour: rgb(224, 224, 224);
+                --page-background-colour: #000000;
+                --page-background-colour-alt: #000000;
+                --grid-colour: #444;
+                --electrode-background-colour: #000;
+                --electrode-min-max-colour: #e0e0e0;
+                --electrode-3d-min-max-colour: #b0b0b0;
+                --electrode-3d-cell-outline-colour: #bbbbbb;
+                --electrode-spike-indicator-colour: #48ff00;
+                --electrode-spike-fill-colour: #48ff00;
+                --electrode-spike-flash-colour: #505050;
+                --electrode-stim-colour: #00ffff;
+                --electrode-stim-fill-colour: #00ffff;
+                --canvas-3d-filter: none;
+            }
+        }
+
+        html {
+            color: var(--page-colour);
+            font-family: 'MetroSans', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+            font-weight: 500;
+        }
+        body {
+            margin: 0;
+            padding: 0;
+            background: linear-gradient(var(--page-background-colour), var(--page-background-colour), var(--page-background-colour-alt));
+        }
+        ::backdrop {
+            background: linear-gradient(var(--page-background-colour), var(--page-background-colour), var(--page-background-colour-alt));
+        }
+        input[type='range']::-webkit-slider-runnable-track {
+            -webkit-appearance: none;
+            appearance: none;
+            background: #777;
+            height: 0.5rem;
+            border-radius: 0.25rem;
+            /* margin-bottom: 0.125rem; */
+        }
+        input[type='range']::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 1rem;
+            height: 1rem;
+            margin-top: -0.25rem;
+        }
+        #renderer {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        #controls {
+            position: absolute;
+            bottom: 0;
+            margin: 5px auto;
+            text-align: center;
+        }
+        #visible_range_in {
+            width: 400px;
+            max-width: 60vw;
+        }
+        #visible_range_label {
+            display: inline-block;
+            text-align: right;
+        }
+        #visible_range_label {
+            min-width: 140px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <input type="checkbox" id="dc-offset-correction" checked class="hidden">
+            <label for="dc-offset-correction" id="dc-offset-correction-label" class="hidden">DC Offset Correction</label>
+            <input type="checkbox" id="hide-crosstalk" checked class="hidden">
+            <label for="hide-crosstalk" class="hidden">Hide Crosstalk</label>
+            <input type="checkbox" id="plot-mode">
+            <label for="plot-mode">3D</label>
+            <input type="checkbox" id="click-to-stimulate" class="hidden">
+            <label for="click-to-stimulate" class="hidden">Click to Stimulate</label>
+            <div id="visibleRangeDiv">
+                <span id="visible_range_label">Visible Range: ±</span>
+                <div class="single-field" style="display: inline-block; width: 140px; vertical-align: middle;">
+                    <button type="button" class="editable" style="border: none;">
+                        <span id="visible_range_value" class="value"></span>
+                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M13.5285 3.1724C13.7229 2.97239 14.0434 2.97011 14.2406 3.16734L16.6259 5.55266C16.8192 5.74596 16.8215 6.05867 16.6309 6.2547L7.79736 15.3433C7.73266 15.4099 7.6507 15.4571 7.56066 15.4797L4.32381 16.293C3.95413 16.3859 3.62064 16.0476 3.71885 15.6793L4.57226 12.4787C4.59431 12.396 4.6372 12.3204 4.69683 12.259L13.5285 3.1724Z" stroke="currentColor" stroke-width="1.5"/>
+                            <path d="M12 6L14 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                    <form class="hidden" id="visible_range_form">
+                        <input id="visible_range_input" type="number" name="range" class="transparent" step="any" min="20"
+                            max="6400" />
+                        <button type="submit" class="button icon-only">
+                            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M19 3L6.49867 17L1 10.8301" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                    </form>
+                    <div class="form-error"></div>
+                </div>
+                <span>μV</span>
+                <input type="range" id="visible_range_in">
+            </div>
+            <button id="stimulate" class="hidden">Stimulate</button>
+            <button id="reset" style="display: inline;">Reset</button>
+            <!-- Dark mode toggle is disabled until further notice -->
+            <button id="enter-dark-mode" class="hidden">Change to Dark Mode</button>
+            <button id="enter-light-mode" class="hidden">Change to Light Mode</button>
+            <button id="pause_toggle" style="width: 75px; display: inline;">Pause</button>
+            <button id="recording_start" style="display: inline;" class="hidden">Record</button>
+            <button id="recording_stop" style="display: none" class="hidden">Stop Recording</button>
+            <span id="recording_status" class="hidden"></span>
+        </div>
+    </header>
+    <main>
+        <div id="visualiser-container">
+            <div id="mea-grid" style="display: none;"></div>
+            <div id="zoom-control" class="hide">
+                <svg class="zoom-icon" width="24" height="24" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M17.545 15.467l-3.779-3.779a6.15 6.15 0 0 0 .898-3.21c0-3.417-2.961-6.377-6.378-6.377A6.185 6.185 0 0 0 2.1 8.287c0 3.416 2.961 6.377 6.377 6.377a6.15 6.15 0 0 0 3.115-.844l3.799 3.801a.953.953 0 0 0 1.346 0l.943-.943c.371-.371.236-.84-.135-1.211zM4.004 8.287a4.282 4.282 0 0 1 4.282-4.283c2.366 0 4.474 2.107 4.474 4.474a4.284 4.284 0 0 1-4.283 4.283c-2.366-.001-4.473-2.109-4.473-4.474z" fill="currentColor"/>
+                </svg>
+                <input type="range" id="zoom-slider" min="0" max="100" value="0" orient="vertical">
+            </div>
+        </div>
+    </main>
+    <div id="renderer" style="display: none;"></div>
+</body>
+<script type="module" src="/visualiser/main.3d.mjs"></script>
+<script type="module" src="/visualiser/main.mjs"></script>
+<script>
+// Tooltip cursor following
+let tooltipStyle = document.createElement('style');
+document.head.appendChild(tooltipStyle);
+
+document.addEventListener('mousemove', (e) => {
+    const tooltip = document.querySelector('[data-tooltip]:hover');
+    if (tooltip) {
+        tooltipStyle.textContent = `
+            [data-tooltip]:hover:after {
+                left: ${e.clientX + 15}px !important;
+                top: ${e.clientY + 15}px !important;
+                bottom: auto !important;
+            }
+        `;
+    }
+});
+</script>
+</html>

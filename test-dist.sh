@@ -3,6 +3,8 @@ set -o errexit
 set -o nounset
 cd "$(dirname "$0")"
 
+source python.sh
+
 echo "Deactivating any active virtual environment..."
 deactivate 2>/dev/null || true
 
@@ -17,11 +19,11 @@ rm -f dist/.tested
 
 # Create and activate a clean test venv
 rm -rf .venv-test
-python3 -m venv .venv-test
+$PYTHON -m venv .venv-test
 source .venv-test/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install --upgrade dist/*.whl
-python3 -m pip install '.[test]'
+$PYTHON -m pip install --upgrade pip
+$PYTHON -m pip install --upgrade dist/*.whl
+$PYTHON -m pip install '.[test]'
 
 # And test.
 echo -e "\033[1mTesting:\033[0m"

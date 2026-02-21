@@ -1,0 +1,60 @@
+{% extends "frame.html.jinja2" %}
+
+{% block title %}Developer Guide{% endblock %}
+
+{% block head %}
+    {{ super() }}
+    <script src="/doc-handler.js"></script>
+{% endblock %}
+
+{% set rendered_preamble = preamble | to_html %}
+{% set toc = rendered_preamble | attr("toc_html") %}
+
+{% block nav %}
+
+  {% block nav_title %}
+    {% if logo %}
+      {% if logo_link %}<a href="{{ logo_link }}">{% endif %}
+      <img src="{{ logo }}" class="logo" alt="project logo"/>
+      {% if logo_link %}</a>{% endif %}
+    {% endif %}
+  {% endblock %}
+
+  {% block search_box %}
+    {% if search and all_modules|length > 1 %}
+      <input type="search" placeholder="Search..." role="searchbox"
+             aria-label="search" pattern=".+" required>
+    {% endif %}
+  {% endblock %}
+
+  {# TOC from preamble headings — mirrors nav_index in module.html.jinja2 #}
+  {% block nav_index %}
+    {% if toc %}
+      <h2>Developer Guide</h2>
+      {{ toc | safe }}
+    {% endif %}
+  {% endblock %}
+
+  <h2 class="module-list-heading">Modules</h2>
+
+  {% macro render_modules(tree, prefix="", depth=0) %}
+      {% for name, subtree in tree.items() %}
+      {% set full_name = (prefix + "." + name) if prefix else name %}
+      {% set url = "/" + "/".join(full_name.split(".")) + ".html" %}
+      <li style="padding-left: {{ depth * 1.5 }}em">
+          <a href="{{ url }}">{{ full_name }}</a>
+          {% if subtree %}{{ render_modules(subtree, full_name, depth + 1) }}{% endif %}
+      </li>
+      {% endfor %}
+  {% endmacro %}
+
+  <ul>{{ render_modules(build_module_tree(all_modules)) }}</ul>
+
+{% endblock %}
+
+{% block content %}
+<main class="pdoc">
+  {{ rendered_preamble | safe }}
+</main>
+{% if search %}{% include "search.html.jinja2" %}{% endif %}
+{% endblock %}

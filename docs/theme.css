@@ -1,0 +1,356 @@
+/**
+ *
+ * Custom styling
+ *
+ */
+
+:root {
+    --pdoc-background: #fff;
+
+    --sidebar-gap: 10px;
+}
+
+.pdoc {
+    --text: #212529;
+    --muted: #6c757d;
+    --link: #3660a5;
+    --link-hover: #1659c5;
+    --code: #f8f8f8;
+    --active: #f0f0f0;
+
+    --accent: #eee;
+    --accent2: #d2d2d2;
+
+    --nav-hover: color-mix(in srgb, transparent 80%, #027AFF);
+    --nav-btn-bg: #606060;
+    --nav-border: #2b2b2b;
+    --search-bg: #fff;
+
+    --code-border: color-mix(in srgb, black 20%, var(--accent2));
+
+    --attr-header_bg: #f0f0f0;
+
+    --name: var(--text);
+    --def: var(--muted);
+    --annotation: var(--muted);
+}
+
+/**
+ *
+ * Dark mode
+ *
+ */
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --pdoc-background: #1A1A1A;
+    }
+
+    .pdoc {
+        --text: #f7f7f7;
+        --muted: #9d9d9d;
+        --link: #58a6ff;
+        --link-hover: #3989ff;
+        --code: #222;
+        --active: #1f1f1f;
+
+        --green: #4CAF50;
+
+        --accent: #333;
+        --accent2: #555;
+
+        --nav-hover: color-mix(in srgb, transparent 80%, #027AFF);
+        --nav-btn-bg: #fff;
+        --nav-border: #fff;
+        --search-bg: #000;
+
+        --code-border: color-mix(in srgb, white 20%, var(--accent2));
+
+        --attr-header_bg: #1f1f1f;
+    }
+    .pdoc .logo {
+        content: url("/images/logo-dark.svg")
+    }
+}
+
+/**
+ *
+ * Navbar
+ *
+ */
+
+/** Module back button */
+body nav.pdoc .module-list-button {
+    backdrop-filter: blur(20px);
+    border-color: transparent;
+    border-radius: 10px;
+    color: color-mix(in srgb, var(--text) 50%, transparent);
+    background-color: color-mix(in srgb, var(--nav-btn-bg) 10%, transparent);
+    transition: 0.3s opacity ease;
+    width: auto;
+    height: 40px
+}
+body nav.pdoc .module-list-button:hover {
+    color: var(--text);
+    background-color: color-mix(in srgb, var(--nav-btn-bg) 20%, transparent);
+}
+
+/** Search bar */
+body nav.pdoc input[type="search"] {
+    background-color: color-mix(in srgb, var(--search-bg) 80%, transparent);
+    border: 1px solid color-mix(in srgb, var(--nav-border) 14%, transparent);
+    border-radius: 24px;
+    padding: 0.4em 1em;
+    color: var(--text);
+}
+
+nav.pdoc > div > ul > li > strong {
+    padding: .2rem 0 .2rem var(--pad);
+    display: block;
+}
+
+/** Mobile */
+@media (max-width: 769px) {
+
+    /** Nav button */
+    body nav #navtoggle {
+        cursor: pointer;
+        position: fixed;
+        width: 50px;
+        height: 40px;
+        top: 2rem;
+        right: 1rem;
+        display: flex;
+        opacity: 1;
+        z-index: 999;
+        backdrop-filter: blur(20px);
+        border-color: transparent;
+        border-radius: 10px;
+        color: color-mix(in srgb, var(--text) 50%, transparent);
+        background-color: color-mix(in srgb, var(--nav-btn-bg) 10%, transparent);
+        transition: 0.3s opacity ease;
+    }
+    body nav #navtoggle:hover {
+        color: var(--text);
+        background-color: color-mix(in srgb, var(--nav-btn-bg) 20%, transparent);
+    }
+
+    /** Nav modal */
+    body nav.pdoc {
+        position: fixed;
+        width: 100vw;
+        background-color: transparent;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding: 0;
+        max-height: 0;
+        background: var(--pdoc-background);
+        border: none;
+    }
+    body nav.pdoc:has(#togglestate:checked) {
+        /* Opens the nav modal */
+        max-height: 100vh;
+    }
+    body nav.pdoc:has(#togglestate:checked) ~ main {
+        /* When the modal is open, hide main to avoid content bleed on iOS Safari */
+        display: none;
+    }
+    body nav.pdoc:has(#togglestate:checked):has(input[type="search"]:valid) ~ main {
+        /* when the modal is open and the user is performing a search */
+        display: block;
+        padding-top: 11em;
+    }
+    body nav.pdoc div > *, body nav.pdoc input[type=search] {
+        /* Horizontal sizing for all elements within the modal */
+        width: 90%;
+        max-width: 450px;
+        margin-left: auto !important;
+        margin-right: auto !important;
+    }
+    body main.pdoc section > .headerlink {
+        /* Prevent '#' links at the first level being rendered offscreen */
+        left: calc(0.5rem - var(--width));
+    }
+    body nav.pdoc .logo {
+        max-width: 250px;
+        margin-top: 70px;
+    }
+
+    /** Module back button */
+    body nav.pdoc .module-list-button {
+        top: 2rem;
+        left: 1rem;
+        position: fixed;
+    }
+}
+
+/** Desktop */
+@media (min-width: 770px) {
+
+    @property --nav-gradient-opacity {
+        syntax: '<number>';
+        initial-value: 0;
+        inherits: false;
+    }
+
+    /** Floating navbar with border, rounded corners, subtle gradient background and hover effects. */
+    body nav.pdoc {
+        --nav-gradient-opacity: 0;
+        position: fixed;
+        height: calc(100% - 2 * var(--sidebar-gap));
+        width: var(--sidebar-width);
+        inset: var(--sidebar-gap) 0 0 var(--sidebar-gap);
+        padding: 0 0 0 var(--pad);
+        border: 1px solid color-mix(in srgb, var(--nav-border) 14%, transparent);
+        border-radius: 18px;
+        background: linear-gradient(
+            135deg,
+            color-mix(in oklab, #3A8988 calc(var(--nav-gradient-opacity) * 20%), var(--pdoc-background)),
+            color-mix(in oklab, #9E8582 calc(var(--nav-gradient-opacity) * 10%), var(--pdoc-background))
+        );
+        box-shadow: 0 0px 0px transparent;
+        transition: --nav-gradient-opacity 0.3s ease, box-shadow 0.3s ease;
+        will-change: opacity, box-shadow;
+    }
+
+    body nav.pdoc::before {
+        content: "";
+        position: fixed;
+        top: var(--sidebar-gap);
+        left: var(--sidebar-gap);
+        display: block;
+        width: var(--sidebar-width);
+        height: 60px;
+        background: linear-gradient(to bottom, var(--pdoc-background) 0%, transparent 100%);
+        border-top-left-radius: 18px;
+        border-top-right-radius: 18px;
+        backdrop-filter: blur(5px);
+        mask-image: linear-gradient(to bottom, black 10%, transparent 100%);
+        pointer-events: none;
+        z-index: 10;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+    }
+
+    body nav.pdoc:hover {
+        --nav-gradient-opacity: 1;
+        box-shadow: 0 8px 15px rgba(80, 80, 80, 0.35);
+    }
+
+    body nav.pdoc.is-scrolled::before {
+        opacity: 1;
+    }
+
+    h1, h2, h3, h4, h5, h6, section, .attr, .classattr {
+        scroll-margin-top: 10px !important;
+    }
+}
+
+/**
+ *
+ * Layout
+ *
+ */
+
+/** First heading of the page */
+.pdoc .module-info .docstring > h1:first-child {
+        font-weight: bold;
+        margin-top: 0;
+        margin-bottom: 1.5em;
+    }
+@media (max-width: 769px) {
+    .pdoc .module-info .docstring > h1:first-child {
+        padding-top: 0;
+    }
+}
+
+/** Hide h1 if it is the last child */
+h1:last-child {
+    display: none;
+}
+
+/** Markdown sections */
+.pdoc h1:target, .pdoc h2:target, .pdoc h3:target, .pdoc h4:target,
+.pdoc h5:target, .pdoc h6:target, .pdoc .pdoc-code > pre > span:target {
+    background: none !important;
+    box-shadow: none !important;
+}
+
+/** Module class or function */
+.pdoc div.attr, .pdoc div.attr:target > * {
+    background-color: var(--attr-header_bg);
+    border-top: 1px solid var(--accent2);
+    transition: all 0.3s ease
+}
+.pdoc div.attr:hover {
+    background-color: color-mix(in srgb, var(--active) 50%, var(--attr-header_bg) 50%);
+    border-top: 1px solid var(--code-border);
+    transition: all 0.3s ease
+}
+.pdoc div.attr:hover {
+    background-color: color-mix(in srgb, var(--active) 50%, var(--attr-header_bg) 50%);
+    border-top: 1px solid var(--code-border);
+    transition: all 0.3s ease
+}
+
+/** Code blocks */
+body main.pdoc .pdoc-code {
+    position: relative;
+}
+body main.pdoc .pdoc-code pre {
+    border-radius: 6px;
+    border: 1px solid var(--accent2);
+    transition: all 0.3s ease;
+}
+body main.pdoc .pdoc-code:hover pre {
+    border-radius: 6px;
+    border: 1px solid var(--code-border);
+    transition: all 0.3s ease;
+}
+body main.pdoc .pdoc-code .copy-button {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    background: #999;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 2px 6px;
+    color: #fff;
+    font-size: 0.8em;
+    opacity: 0.0;
+    transition: opacity 0.3s ease;
+}
+body main.pdoc .pdoc-code:hover .copy-button {
+    opacity: 0.4;
+}
+body main.pdoc .pdoc-code .copy-button.copied {
+    opacity: 1;
+    background: var(--green);
+}
+body main.pdoc .pdoc-code .copy-button:hover {
+    opacity: 1;
+}
+
+/** View value button */
+body main.pdoc .view-value-button {
+    backdrop-filter: blur(20px);
+    border-color: transparent;
+    border-radius: 10px;
+    color: color-mix(in srgb, var(--text) 50%, transparent);
+    background-color: color-mix(in srgb, var(--nav-btn-bg) 10%, transparent);
+    transition: 0.3s all ease;
+}
+body main.pdoc .view-value-button::before {
+    width: 3em;
+}
+body main.pdoc .view-value-button:hover {
+    color: var(--text);
+    background-color: color-mix(in srgb, var(--nav-btn-bg) 20%, transparent);
+}
+
+img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 3px;
+}

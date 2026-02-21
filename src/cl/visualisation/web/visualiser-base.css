@@ -1,0 +1,74 @@
+:root {
+    --bg-color: #f9f9f9;
+    --text-color: #000000;
+    --border-color: #ddd;
+    --input-bg: #ffffff;
+    --description-color: #666;
+    --disabled-bg: #ccc;
+    --list-item-bg: #f0f0f0;
+    --details-bg: transparent;
+    --canvas-bg: black;
+    --select-arrow: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23343a40' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m2 5 6 6 6-6'/%3e%3c/svg%3e");
+    --panel-bg: rgba(255, 255, 255, 0.0);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg-color: #1a1a1a;
+        --text-color: #e0e0e0;
+        --border-color: #444;
+        --input-bg: #2a2a2a;
+        --description-color: #aaa;
+        --disabled-bg: #444;
+        --list-item-bg: #2a2a2a;
+        --details-bg: transparent;
+        --canvas-bg: black;
+        --select-arrow: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23e0e0e0' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m2 5 6 6 6-6'/%3e%3c/svg%3e");
+        --panel-bg: rgba(255, 255, 255, 0.01);
+    }
+}
+
+body {
+    font-family: 'MetroSans', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+    font-weight: 500;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+}
+
+fieldset {
+    margin-bottom: 10px;
+    border: 1px solid var(--border-color);
+    padding: 15px;
+    border-radius: 5px;
+}
+
+legend {
+    font-weight: 550;
+    font-size: 1.1em;
+    color: var(--text-color);
+}
+
+details {
+    padding: 1px 10px;
+    /* border: 1px solid #ddd;
+    border-radius: 5px; */
+    overflow: hidden;
+    background-color: var(--details-bg);
+}
+
+.description, p {
+    font-size: 0.9em;
+    font-weight: 400 !important;
+    color: var(--description-color);
+    margin-top: 3px;
+    margin-bottom: 5px;
+}
+
+label {
+    display: block;
+    font-weight: 550;
+    margin-bottom: 3px;
+}

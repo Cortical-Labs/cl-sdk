@@ -3,6 +3,8 @@ set -o errexit
 set -o nounset
 cd "$(dirname "$0")"
 
+source python.sh
+
 echo "Deactivating any active virtual environment..."
 deactivate 2>/dev/null || true
 
@@ -51,14 +53,14 @@ then
 fi
 
 # Create and activate a publish venv
-python3 -m venv .venv-publish
+$PYTHON -m venv .venv-publish
 source .venv-publish/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install --upgrade twine
+$PYTHON -m pip install --upgrade pip
+$PYTHON -m pip install --upgrade twine
 
 # And publish.
 DIST_FILES_ONE_LINE=$(echo "$DIST_FILES" | tr '\n' ' ')
-python3 -m twine upload $DIST_FILES_ONE_LINE
+$PYTHON -m twine upload $DIST_FILES_ONE_LINE
 
 echo
 echo "Done. You'll need to reactivate your previous virtual environment if you had one."

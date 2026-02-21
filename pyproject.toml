@@ -1,12 +1,12 @@
 [project]
 name = "cl-sdk"
-version = "0.1.0"
+version = "0.29.0"
 authors = [
     { name="Cortical Labs Pte Ltd", email="info@corticallabs.com" },
 ]
 description = "Simulator for the Cortical Labs cl API"
 readme = "README.md"
-requires-python = ">=3.10.0"
+requires-python = ">=3.12.0"
 classifiers = [
     "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
@@ -20,7 +20,14 @@ dependencies = [
     "msgpack_numpy",
     "tables",
     "dotenv",
-    "matplotlib"
+    "matplotlib",
+    "pydantic",
+    "scipy",
+    "networkx",
+    "python-louvain",
+    "pandas",
+    "websockets",
+    "ipykernel"
 ]
 
 [project.optional-dependencies]
@@ -28,12 +35,12 @@ test = [
     "pytest",
     "pytest_mock",
     "inline_snapshot[black]",
-    "matplotlib"
+    "pdoc"
 ]
 
 [project.urls]
 Homepage = "https://github.com/Cortical-Labs/cl-sdk"
-Documentation = "https://github.com/Cortical-Labs/cl-sdk"
+Documentation = "https://docs.corticallabs.com"
 Source = "https://github.com/Cortical-Labs/cl-sdk"
 
 [build-system]
