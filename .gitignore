@@ -2,5 +2,4 @@
 /dist/
 **/.pytest_cache/
 **/__pycache__/
-docs/html
 .DS_Store
