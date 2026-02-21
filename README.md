@@ -2,7 +2,7 @@
 
 This package provides an implementation of the CL API to assist with local development of applications that can run on a Cortical Labs CL1 system.
 
-Please refer to [https://docs.corticallabs.com] for the latest documentation.
+Please refer to [docs.corticallabs.com](https://docs.corticallabs.com) for the latest documentation.
 
 ## Prerequisites
 
