@@ -2,8 +2,10 @@
 This builds the Cortical Labs API documentation using source code from src/cl
 and places it in docs/html.
 """
+import re
 import sys
 import shutil
+
 from pathlib import Path
 from typing import Mapping, cast
 
@@ -81,6 +83,18 @@ if __name__ == "__main__":
     pdoc.render.env.globals["build_module_tree"] = _build_module_tree
 
     pdoc.pdoc(module_path, output_directory=output_path)
+
+    # Strip noisy PydanticUndefined default values from rendered HTML
+    pattern = re.compile(
+        r"\s*=\s*<span\s+class=\"default_value\">\s*PydanticUndefined\s*</span>",
+        re.DOTALL,
+    )
+
+    for html_file in output_path.rglob("*.html"):
+        html_text = html_file.read_text(encoding="utf-8")
+        cleaned_html = pattern.sub("", html_text)
+        if cleaned_html != html_text:
+            html_file.write_text(cleaned_html, encoding="utf-8")
 
     # Post-process: build all_modules from generated files, render our custom index
     all_modules = {

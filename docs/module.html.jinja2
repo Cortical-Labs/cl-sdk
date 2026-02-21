@@ -6,7 +6,7 @@
     {{ super() }}
     <script src="/doc-handler.js"></script>
 {% endblock %}
-{% block title %}{{ module.modulename }} API documentation{% endblock %}
+{% block title %}CL API Reference: {{ module.modulename }}{% endblock %}
 {% block nav %}
     {% block module_list_link %}
         {% set parentmodule = ".".join(module.modulename.split(".")[:-1]) %}
@@ -51,7 +51,7 @@
 
     {% block nav_members %}
         {% if module.members %}
-            <h2>API Documentation</h2>
+            <h2>{{ module.modulename }}</h2>
             {{ nav_members(module.members.values()) }}
         {% endif %}
     {% endblock %}
