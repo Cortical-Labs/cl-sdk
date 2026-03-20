@@ -81,7 +81,7 @@ def _analyse_functional_connectivity(
         result.graph_partition  = community_louvain.best_partition(graph, weight="weight") # dict {node: community_id}
         if len(set(result.graph_partition.values())) > 1:
             result.modularity_index = float(community_louvain.modularity(result.graph_partition, graph, weight="weight"))
-    except:
+    except Exception:
         ...
 
     # Betweenness centrality (weighted)

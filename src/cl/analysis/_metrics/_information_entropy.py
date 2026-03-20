@@ -11,7 +11,7 @@ def _analyse_information_entropy(
     log_base:       float | None = None,
     ) -> AnalysisResultInformationEntropy:
     """
-    See RecordingView.analyse_lempel_ziv_complexity()
+    See RecordingView.analyse_information_entropy()
     """
     sampling_frequency = recording._analysis_cache.metadata.sampling_frequency
     bin_size_frames    = max(1, int(round(bin_size_sec * sampling_frequency)))

@@ -398,7 +398,7 @@ class StimDesign:
         for i, (duration_us, current_uA) in enumerate(zip(durations, currents)):
             # Total charge
             charge_pC = current_uA * duration_us
-            if charge_pC > self._PHASE_CHARGE_INJECTION_LIMIT_PC:
+            if abs(charge_pC) > self._PHASE_CHARGE_INJECTION_LIMIT_PC:
                 raise ValueError(
                     f"Charge injection of "
                     f"{duration_us} us x {current_uA} uA = {charge_pC / 1000} nC "
