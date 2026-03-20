@@ -241,7 +241,7 @@ def _analyse_criticality(
         time_lags_k              = branching_ratio_result["time_lags_k"]
         time_lags_slopes         = branching_ratio_result["slopes"]
         time_lags_fit_parameters = branching_ratio_result["optimal_fit_parameters"]
-    except:
+    except Exception:
         ...
 
     return AnalysisResultCriticality(
