@@ -55,12 +55,12 @@ fi
 # Create and activate a publish venv
 $PYTHON -m venv .venv-publish
 source .venv-publish/bin/activate
-$PYTHON -m pip install --upgrade pip
-$PYTHON -m pip install --upgrade twine
+python -m pip install --upgrade pip
+python -m pip install --upgrade twine
 
 # And publish.
 DIST_FILES_ONE_LINE=$(echo "$DIST_FILES" | tr '\n' ' ')
-$PYTHON -m twine upload $DIST_FILES_ONE_LINE
+python -m twine upload $DIST_FILES_ONE_LINE
 
 echo
 echo "Done. You'll need to reactivate your previous virtual environment if you had one."
