@@ -19,7 +19,7 @@ $ pip3 install cl-sdk
 
 ### On a CL1 System
 
-A custom version of this SDK is included on CL1 systems, that interfaces with the hardware. For applications, if `cl-sdk` is listed as a dependency in the `requirements.txt` file, it will automatically consolidate with the system, regardless of the version of `cl-sdk` specified (although versions `<0.30.0` are not supported). If using a custom virtual environment on the CL1 without system site-packages, `cl-sdk` can be installed, but after this, the `cl-api` package is required to be installed from the local file included on the CL1 at `/opt/cl-api-whl/cl_api-*.whl` (where `*` corresponds to the version number). This will allow the application to properly interface with the CL1 hardware.
+A custom version of this SDK is included on CL1 systems, that interfaces with the hardware. For applications, if `cl-sdk` is listed as a dependency in the `requirements.txt` file, it will automatically consolidate with the system, regardless of the version of `cl-sdk` specified (although versions `<1.0.0` are not supported). If using a custom virtual environment on the CL1 without system site-packages, `cl-sdk` can be installed, but after this, the `cl-api` package is required to be installed from the local file included on the CL1 at `/opt/cl-api-whl/cl_api-*.whl` (where `*` corresponds to the version number). This will allow the application to properly interface with the CL1 hardware.
 
 ## Cortical Labs Developer Guide
 
