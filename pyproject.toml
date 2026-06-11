@@ -1,6 +1,6 @@
 [project]
 name = "cl-sdk"
-version = "0.30.0"
+version = "1.0.0"
 authors = [
     { name="Cortical Labs Pte Ltd", email="info@corticallabs.com" },
 ]
