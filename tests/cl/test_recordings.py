@@ -185,89 +185,89 @@ def test_recording(mocker: MockerFixture, tmp_path: Path):
     assert expected_fpath.exists()
 
     # Load and check the recording as a RecordingView
-    recording_view: RecordingView = RecordingView(str(expected_fpath))
+    with RecordingView(str(expected_fpath)) as recording_view:
 
-    assert hasattr(recording_view, "spikes")
-    assert hasattr(recording_view, "stims")
-    assert hasattr(recording_view, "samples")
-    assert hasattr(recording_view, "attributes")
+        assert hasattr(recording_view, "spikes")
+        assert hasattr(recording_view, "stims")
+        assert hasattr(recording_view, "samples")
+        assert hasattr(recording_view, "attributes")
 
-    # Check the recording attributes
-    attributes: AttributesView = recording_view.attributes
-    assert "application" in attributes
-    assert "created_localtime" in attributes
-    assert "created_utc" in attributes
-    assert "ended_localtime" in attributes
-    assert "ended_utc" in attributes
-    assert "channel_count" in attributes
-    assert "sampling_frequency" in attributes
-    assert "frames_per_second" in attributes
-    assert "uV_per_sample_unit" in attributes
-    assert "start_timestamp" in attributes
-    assert "end_timestamp" in attributes
-    assert "duration_frames" in attributes
-    assert "duration_seconds" in attributes
-    assert "file_format" in attributes
-    assert "version" in attributes["file_format"]
-    assert "stim_and_spike_timestamps_relative_to_start" in attributes["file_format"]
+        # Check the recording attributes
+        attributes = recording_view.attributes
+        assert "application" in attributes
+        assert "created_localtime" in attributes
+        assert "created_utc" in attributes
+        assert "ended_localtime" in attributes
+        assert "ended_utc" in attributes
+        assert "channel_count" in attributes
+        assert "sampling_frequency" in attributes
+        assert "frames_per_second" in attributes
+        assert "uV_per_sample_unit" in attributes
+        assert "start_timestamp" in attributes
+        assert "end_timestamp" in attributes
+        assert "duration_frames" in attributes
+        assert "duration_seconds" in attributes
+        assert "file_format" in attributes
+        assert "version" in attributes["file_format"]
+        assert "stim_and_spike_timestamps_relative_to_start" in attributes["file_format"]
 
-    # Check the duration
-    recording_duration = attributes["duration_seconds"]
-    start_timestamp    = attributes["start_timestamp"]
-    end_timestamp      = attributes["end_timestamp"]
-    duration_frames    = attributes["duration_frames"]
-    assert_allclose(recording_duration, duration_sec, rtol=0.1)
-    assert end_timestamp == start_timestamp + duration_frames
+        # Check the duration
+        recording_duration = attributes["duration_seconds"]
+        start_timestamp    = attributes["start_timestamp"]
+        end_timestamp      = attributes["end_timestamp"]
+        duration_frames    = attributes["duration_frames"]
+        assert_allclose(recording_duration, duration_sec, rtol=0.1)
+        assert end_timestamp == start_timestamp + duration_frames
 
-    # Check sample shape
-    recording_frames   = attributes["duration_frames"]
-    recording_channels = attributes["channel_count"]
+        # Check sample shape
+        recording_frames   = attributes["duration_frames"]
+        recording_channels = attributes["channel_count"]
 
-    assert recording_view.samples is not None
-    sample_frames, sample_channels = recording_view.samples.shape
-    assert recording_frames   == sample_frames
-    assert recording_channels == sample_channels
+        assert recording_view.samples is not None
+        sample_frames, sample_channels = recording_view.samples.shape
+        assert recording_frames   == sample_frames
+        assert recording_channels == sample_channels
 
-    # Check spike timestamps are relative to recording start_timestamp
-    assert recording_view.spikes is not None
-    for spike in recording_view.spikes:
-        assert 0 <= spike["timestamp"] <= duration_frames
+        # Check spike timestamps are relative to recording start_timestamp
+        assert recording_view.spikes is not None
+        for spike in recording_view.spikes:
+            assert 0 <= spike["timestamp"] <= duration_frames
 
-    # Check stim timestamps are are relative to recording start_timestamp
-    assert recording_view.stims is not None
-    for stim in recording_view.stims:
-        assert 0 <= stim["timestamp"] <= duration_frames
+        # Check stim timestamps are are relative to recording start_timestamp
+        assert recording_view.stims is not None
+        for stim in recording_view.stims:
+            assert 0 <= stim["timestamp"] <= duration_frames
 
-    # Check datastreams
-    assert recording_view.data_streams is not None
-    assert hasattr(recording_view.data_streams, "test_data_stream")
+        # Check datastreams
+        assert recording_view.data_streams is not None
+        assert hasattr(recording_view.data_streams, "test_data_stream")
 
-    test_data_stream = recording_view.data_streams.test_data_stream
-    assert test_data_stream.attributes["name"] == "test_data_stream"
-    assert test_data_stream.attributes["application"] == snapshot({
-        "hello": "world",
-        "score": 2,
-        "new_attribute": 9.9
-    })
-    recording_start_timestamp = recording_view.attributes["start_timestamp"]
-    assert list(test_data_stream.keys()) == snapshot([
-        timestamp - recording_start_timestamp + 0,
-        timestamp - recording_start_timestamp + 1,
-        timestamp - recording_start_timestamp + 2,
-        timestamp - recording_start_timestamp + 3
-    ])
-    actual_values = list(test_data_stream.values())
-    expected_values = [
-        data_stream_data_dict,
-        data_stream_data_list,
-        data_stream_data_str,
-        data_stream_data_array
-    ]
-    for actual, expected in zip(actual_values, expected_values):
-        if isinstance(expected, np.ndarray):
-            np.testing.assert_allclose(actual, expected)
-        else:
-            assert actual == expected
+        test_data_stream = recording_view.data_streams.test_data_stream
+        assert test_data_stream.attributes["name"] == "test_data_stream"
+        assert test_data_stream.attributes["application"] == snapshot({
+            "hello": "world",
+            "score": 2,
+            "new_attribute": 9.9
+        })
+        recording_start_timestamp = recording_view.attributes["start_timestamp"]
+        assert list(test_data_stream.keys()) == snapshot([
+            timestamp - recording_start_timestamp + 0,
+            timestamp - recording_start_timestamp + 1,
+            timestamp - recording_start_timestamp + 2,
+            timestamp - recording_start_timestamp + 3
+        ])
+        actual_values = list(test_data_stream.values())
+        expected_values = [
+            data_stream_data_dict,
+            data_stream_data_list,
+            data_stream_data_str,
+            data_stream_data_array
+        ]
+        for actual, expected in zip(actual_values, expected_values):
+            if isinstance(expected, np.ndarray):
+                np.testing.assert_allclose(actual, expected)
+            else:
+                assert actual == expected
 
 def test_recording_frame_correctness(tmp_path: Path):
     """ Tests that neurons.read() is accurate, especially with wrapping replay file. """
@@ -282,8 +282,7 @@ def test_recording_frame_correctness(tmp_path: Path):
     replay_path = str(generate_recording(tmp_path, duration_sec=2))
     os.environ["CL_SDK_REPLAY_PATH"] = replay_path
     try:
-        with cl.open() as neurons:
-            replay_view     = RecordingView(replay_path)
+        with cl.open() as neurons, RecordingView(replay_path) as replay_view:
             replay_samples  = replay_view.samples
             replay_duration = int(replay_view.attributes["duration_frames"])  # 25kHz file frames
             start_ts        = neurons.timestamp()
@@ -299,7 +298,6 @@ def test_recording_frame_correctness(tmp_path: Path):
                 t = (i + neurons._replay_start_offset) % replay_duration
                 np.testing.assert_allclose(replay_samples[t : t+step, :], frames[i : i + step, :]), f"{frames.shape[0]=} {i=}, {t=}"
             print("Pass!")
-            replay_view.close()
     finally:
         os.environ.pop("CL_SDK_REPLAY_PATH", None)
 

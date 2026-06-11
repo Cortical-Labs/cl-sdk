@@ -21,14 +21,13 @@ rm -f dist/.tested
 rm -rf .venv-test
 $PYTHON -m venv .venv-test
 source .venv-test/bin/activate
-$PYTHON -m pip install --upgrade pip
-$PYTHON -m pip install --upgrade dist/*.whl
-$PYTHON -m pip install '.[test]'
+python -m pip install --upgrade pip
+python -m pip install --upgrade dist/*.whl
+python -m pip install '.[test]'
 
 # And test.
 echo -e "\033[1mTesting:\033[0m"
-cd tests
-pytest -v && touch ../dist/.tested
+python -m pytest -v && touch dist/.tested
 
 echo
 echo "Done. You'll need to reactivate your previous virtual environment if you had one."
