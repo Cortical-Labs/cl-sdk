@@ -1,5 +1,5 @@
 import * as THREE from '/visualiser/three.module.min.js';
-import { connect, getAnalysisMsPerResult, getAnalysisToRender, getBufferSize, stimulate, isBuffering, setVisibleAbsUv } from '/visualiser/analysis.mjs';
+import { connect, getAnalysisMsPerResult, getAnalysisToRender, getBufferSize, stimulate, isBuffering, setVisibleAbsUv, getUrlSearchParams, getIsPlaybackPaused } from '/visualiser/analysis.mjs';
 import { rowColChannelLayout } from '/visualiser/layout.mjs';
 
 connect(); // Start analysis module connection
@@ -8,24 +8,7 @@ connect(); // Start analysis module connection
 // Skip rendering for these to save ~6% of waveform processing
 const disconnectedChannels = new Set([0, 7, 56, 63]);
 
-// Get URL parameters, supporting iframe embedding
-let searchParams;
-try {
-    searchParams = window.parent?.location.search ?? window.location.search;
-
-    // Merge with own search params to allow overrides
-    const parentParams = new URLSearchParams(searchParams);
-    const ownParams    = new URLSearchParams(window.location.search);
-    for (const [key, value] of ownParams.entries()) {
-        parentParams.set(key, value);
-    }
-    searchParams = parentParams.toString() ? `?${parentParams.toString()}` : '';
-}
-catch (e) {
-    // Cross-origin iframe, fall back to own location
-    searchParams = window.location.search;
-}
-const urlParams = new URLSearchParams(searchParams);
+const urlParams = getUrlSearchParams();
 
 // The MEA endpoint is for showing the 3D visualiser only, and needs different camera defaults (as well as a full screen toggle)
 const isMeaPage = window.location.pathname == '/mea/';
@@ -819,12 +802,7 @@ try {
 }
 
 function showWebGLError(errorDetails = null) {
-    // Hide the renderer element
-    if (rendererElement) {
-        rendererElement.style.display = 'none';
-    }
-
-    // Create error message container
+    // Create error message container (but don't insert yet)
     const errorContainer = document.createElement('div');
     errorContainer.id = 'webgl-error';
     errorContainer.innerHTML = `
@@ -848,16 +826,38 @@ function showWebGLError(errorDetails = null) {
         </p>
     `;
 
-    // Insert into visualiser container
-    if (visualiserContainer) {
-        visualiserContainer.appendChild(errorContainer);
+    function insertError() {
+        // Only show the error when 3D mode is active (renderer is visible)
+        if (rendererElement && (rendererElement.style.display === 'none' || rendererElement.hidden)) {
+            // 3D mode is off — remove the error if it was previously shown
+            document.getElementById('webgl-error')?.remove();
+            return;
+        }
+
+        // Avoid inserting twice
+        if (document.getElementById('webgl-error')) return;
+
+        // Hide the renderer element
+        if (rendererElement) {
+            rendererElement.style.display = 'none';
+        }
+
+        // Insert into visualiser container
+        if (visualiserContainer) {
+            visualiserContainer.appendChild(errorContainer);
+        }
+
+        // Hide zoom control
+        const zoomControl = document.getElementById('zoom-control');
+        if (zoomControl) {
+            zoomControl.style.display = 'none';
+        }
     }
 
-    // Hide zoom control
-    const zoomControl = document.getElementById('zoom-control');
-    if (zoomControl) {
-        zoomControl.style.display = 'none';
-    }
+    // Show immediately if already visible (e.g. /mea/ page), otherwise wait
+    // for the renderer to become visible when the user switches to 3D mode
+    insertError();
+    rendererElement?.addEventListener('visibilitychange', insertError);
 }
 
 // Helper function to find row and col for a given channel
@@ -2476,7 +2476,7 @@ function render(timestamp) {
         return;
     }
 
-    if (window.paused !== true) {
+    if (window.paused !== true && !getIsPlaybackPaused()) {
         for (let i = 0; i < measurementPlanes; i++)
             planePositions[i] -= depthPerMs * relativeTimestamp;
 

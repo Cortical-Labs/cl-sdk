@@ -19,7 +19,7 @@ from numpy import ndarray
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from . import Spike, Stim
+    from .. import Spike, Stim
 
 # Queue batch processing settings
 QUEUE_TIMEOUT_SECS = 0.2  # How long to wait for items when queue is empty

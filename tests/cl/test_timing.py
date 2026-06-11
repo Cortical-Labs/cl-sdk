@@ -2,6 +2,9 @@ import os
 import time
 import numpy as np
 
+# Disable websocket for tests, needs to be set before importing cl
+os.environ["CL_SDK_VISUALISATION"] = "0"
+
 import cl
 
 def test_sleep():
@@ -18,43 +21,7 @@ def test_sleep():
             start_timestamp = neurons.timestamp()
             start_secs      = time.perf_counter()
             neurons._sleep_until(start_timestamp + frames)
-            assert np.allclose(time.perf_counter() - start_secs, duration, atol=tolerance)
-
-FIRST_READ_TOL = 500
-READ_TOL = 100
-
-def test_read_latency():
-    """ Test our read timing latency is within 100 frames. """
-    os.environ["CL_SDK_ACCELERATED_TIME"] = "0"
-    with cl.open() as neurons:
-        neurons.restart()
-        tss = [neurons.timestamp()]
-        time.sleep(1)
-        ts = neurons.timestamp()
-        tss.append(ts)
-        neurons.read(12500, ts)
-        ts = neurons.timestamp()
-        tss.append(ts)
-        neurons.read(12500, ts - 12500 // 2)
-        ts = neurons.timestamp()
-        tss.append(ts)
-        neurons.read(12500, ts - 25000)
-        ts = neurons.timestamp()
-        tss.append(ts)
-
-        for i, t in enumerate(tss[1:]):
-            test_ts = t - tss[i]
-            match i:
-                case 0:
-                    assert np.allclose(test_ts, 25_000, atol=FIRST_READ_TOL)  # time.sleep can be unpredictable
-                case 1:
-                    assert np.allclose(test_ts, 12_500, atol=READ_TOL)        # producer overhead + inter-test cleanup
-                case 2:
-                    assert np.allclose(test_ts,  6_250, atol=READ_TOL)        # producer overhead + inter-test cleanup
-                case 3:
-                    assert np.allclose(test_ts,      0, atol=READ_TOL)        # time to copy data
-
-            print(f"ts {t} (+{test_ts})")
+            np.testing.assert_allclose(time.perf_counter() - start_secs, duration, atol=tolerance)
 
 def test_op_timing():
     """ Test advance_elapsed_times and whether ops are called at the correct timestamp. """

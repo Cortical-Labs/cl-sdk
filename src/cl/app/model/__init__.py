@@ -41,7 +41,7 @@ limits:
 ### Composite Models
 
 - `StimPulseComponentModel`: Single-phase pulse definition with amplitude and width
-- `StimDesignModel`: Multi-component pulse designs with automatic validation
+- `StimDesignModel`: Multi-component pulse designs with automatic validation and custom UI
 - `StimFrequencyRangeHzModel`: Min/max frequency ranges with validation
 - `SizeIntModel`: 2D integer dimensions for layouts and grids
 

@@ -1,8 +1,13 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 
-from matplotlib.axes import Axes
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
-from . import Array1DInt, Array1DFloat, Bursts
+    from . import Array1DInt, Array1DFloat, Bursts
 
 def _plot_firing_rate_bins(
     x:  Array1DInt | Array1DFloat,

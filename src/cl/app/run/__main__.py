@@ -1,19 +1,15 @@
 import os
-
-# Setup environment variables for app runner mode
-os.environ["CL_SDK_WEBSOCKET"] = "1"
-
 import argparse
 import importlib.util
 import json
+import logging
 import sys
 from pathlib import Path
 
-from cl import Neurons
-from cl.app import BaseApplication, BaseApplicationConfig
-from cl.util import in_vscode
-
 def _setup_visualiser(app_id: str, web_path: Path):
+    from cl import Neurons
+    from cl.util import in_vscode
+
     html_path = web_path / "vis.html"
     js_path   = web_path / "vis.mjs"
 
@@ -27,8 +23,6 @@ def _setup_visualiser(app_id: str, web_path: Path):
     if in_vscode() and "SSH_CONNECTION" in os.environ:
         ssh_connection = os.environ["SSH_CONNECTION"]
         ssh_ip = ssh_connection.split(" ")[2]
-
-    ws_port = os.environ.get("CL_SDK_WEBSOCKET_PORT", "1025")
 
     html_content = f"""
 <!DOCTYPE html>
@@ -55,7 +49,6 @@ def _setup_visualiser(app_id: str, web_path: Path):
 <script>
     const uniqueId = "visualiser";
     const sshIp    = {json.dumps(ssh_ip)};
-    const websocketPort = {ws_port};
 </script>
 <script src="/visualiser/engine.mjs"></script>
 
@@ -68,7 +61,11 @@ def _main() -> int:
     parse.add_argument("target_dir", help="Path to the application directory (default: current directory)")
     parse.add_argument("config_json", help="Path to the configuration JSON file")
     parse.add_argument("output_dir", nargs="?", default=".", help="Optional path to an output directory for logs or other generated files (default: current directory)")
+    parse.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parse.parse_args()
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
 
     app_path    = Path(args.target_dir).resolve()
     config_path = Path(args.config_json).resolve()
@@ -131,6 +128,9 @@ def _main() -> int:
 
     application = module.application
 
+    from cl import Neurons
+    from cl.app import BaseApplication, BaseApplicationConfig
+
     if not isinstance(application, BaseApplication):
         print(f"Error: 'application' object in {init_py} is not an instance of BaseApplication", file=sys.stderr)
         return 1
@@ -143,9 +143,12 @@ def _main() -> int:
         print("Error: Failed to validate configuration JSON against the application's config schema", file=sys.stderr)
         return 1
 
-    web_path = app_path / "web"
-    if web_path.is_dir():
-        _setup_visualiser(app_path.name, web_path)
+    neurons = Neurons._get_instance()
+    if neurons._use_websocket_server:
+        web_path = app_path / "web"
+        if web_path.is_dir():
+            _setup_visualiser(app_path.name, web_path)
+    neurons._start_simulator_services()
 
     print(f"Running application in {app_path} with configuration {config_path}")
 

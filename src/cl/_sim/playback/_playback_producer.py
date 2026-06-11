@@ -10,12 +10,11 @@ from the recording file rather than from command queues.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import logging
-import sys
 import time
-import traceback
-from dataclasses import dataclass
-from multiprocessing import Process, Queue
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -23,29 +22,17 @@ import numpy as np
 from .._base_producer import BaseProducer, BaseProducerWorker
 from .._data_buffer import (
     DataStreamEventRecord,
+    SpikeRecord,
     StimRecord,
 )
+from .._subprocess import PopenProcess
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import tables
 
 _logger = logging.getLogger("cl.playback.producer")
 
 DEFAULT_TICK_RATE_HZ = 5000  # 5kHz producer rate (5 frames/tick at 25kHz)
-
-@dataclass
-class SeekCommand:
-    """Command to seek to a specific timestamp."""
-    target_timestamp: int
-
-@dataclass
-class SetPausedCommand:
-    """Command to set the pause state."""
-    paused: bool
-
-@dataclass
-class ShutdownCommand:
-    """Command to shut down the producer."""
 
 def _producer_main(
     replay_file_path : str,
@@ -54,45 +41,18 @@ def _producer_main(
     duration_frames  : int,
     start_timestamp  : int,
     tick_rate_hz     : int,
-    command_queue    : Queue,
     name_prefix      : str,
 ) -> None:
-    """
-    Main function for the playback producer subprocess.
-
-    This runs in a separate process and:
-    1. Attaches to the shared memory buffer (created by main process)
-    2. Reads frames, spikes, stims from the recording file
-    3. Writes data to shared memory at tick_rate_hz
-    4. Handles seek/pause commands from the queue
-
-    Args:
-        replay_file_path: Path to the H5 recording file
-        channel_count: Number of channels
-        frames_per_second: Sample rate
-        duration_frames: Total frames in recording file
-        start_timestamp: Starting timestamp (from recording attributes)
-        tick_rate_hz: Producer loop rate in Hz
-        command_queue: Queue for receiving seek/pause/shutdown commands
-        name_prefix: Unique prefix for shared memory (from parent process)
-    """
-    try:
-        producer = PlaybackProducerWorker(
-            replay_file_path  = replay_file_path,
-            channel_count     = channel_count,
-            frames_per_second = frames_per_second,
-            duration_frames   = duration_frames,
-            start_timestamp   = start_timestamp,
-            tick_rate_hz      = tick_rate_hz,
-            command_queue     = command_queue,
-            name_prefix       = name_prefix,
-        )
-        producer.run()
-    except Exception as e:
-        print(f"Playback producer subprocess failed: {e}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        sys.stderr.flush()
-        raise
+    producer = PlaybackProducerWorker(
+        replay_file_path  = replay_file_path,
+        channel_count     = channel_count,
+        frames_per_second = frames_per_second,
+        duration_frames   = duration_frames,
+        start_timestamp   = start_timestamp,
+        tick_rate_hz      = tick_rate_hz,
+        name_prefix       = name_prefix,
+    )
+    BaseProducerWorker.run_in_subprocess(producer, "Playback producer")
 
 class PlaybackProducerWorker(BaseProducerWorker):
     """
@@ -113,31 +73,33 @@ class PlaybackProducerWorker(BaseProducerWorker):
         duration_frames  : int,
         start_timestamp  : int,
         tick_rate_hz     : int,
-        command_queue    : Queue,
         name_prefix      : str,
     ):
         super().__init__(
-            replay_file_path  = replay_file_path,
             channel_count     = channel_count,
             frames_per_second = frames_per_second,
             tick_rate_hz      = tick_rate_hz,
-            command_queue     = command_queue,
             name_prefix       = name_prefix,
+            start_timestamp   = start_timestamp,
+            duration_frames   = duration_frames,
         )
-
-        self._duration_frames   = duration_frames
-        self._start_timestamp   = start_timestamp
+        self._replay_file_path = replay_file_path
 
         # Playback state
-        self._current_timestamp = start_timestamp
-        self._paused            = True  # Start paused
+        self._paused             = True  # Start paused
+        self._speed              = 1.0   # Playback speed multiplier
+        self._last_seek_sequence = 0
 
-        # Additional replay data (opened in run())
-        self._replay_stims        = None
-        self._replay_data_streams = None
+        # Replay file handle and data references (opened in run())
+        from cl.util import RecordingView
+        self._recording_view     : RecordingView | None = None
+        self._replay_file        : tables.File   | None = None
+        self._replay_stims                              = None
+        self._replay_data_streams                       = None
 
         # Pre-loaded timestamp arrays for efficient binary search
-        self._stim_timestamps: np.ndarray | None = None
+        self._spike_timestamps  : np.ndarray | None     = None
+        self._stim_timestamps   : np.ndarray | None     = None
         self._datastream_indices: dict[str, np.ndarray] = {}
 
     def run(self) -> None:
@@ -145,8 +107,8 @@ class PlaybackProducerWorker(BaseProducerWorker):
         # Use base class utilities for setup
         BaseProducerWorker.set_process_priority()
         self.attach_buffer()
-        self.open_replay_file()
-        self.load_spike_timestamps()
+        self._open_replay_file()
+        self._load_spike_timestamps()
 
         # Load additional playback-specific data
         self._load_stims_and_datastreams()
@@ -165,10 +127,11 @@ class PlaybackProducerWorker(BaseProducerWorker):
 
         # Signal readiness
         assert self._buffer is not None
-        self._buffer.producer_ready = True
-        self._buffer.pause_flag     = True  # Start paused
-        start_wall_ns               = time.perf_counter_ns()
-        tick_count                  = 0
+        self._buffer.producer_ready  = True
+        self._buffer.pause_flag      = True  # Start paused
+        self._buffer.playback_speed  = self._speed
+        start_wall_ns                = time.perf_counter_ns()
+        tick_count                   = 0
 
         while self._running:
             # Process commands first
@@ -189,7 +152,8 @@ class PlaybackProducerWorker(BaseProducerWorker):
 
             # Calculate timestamp range for this tick
             from_ts = self._current_timestamp
-            to_ts   = from_ts + self._frames_per_tick
+            scaled_frames = max(1, int(self._frames_per_tick * self._speed))
+            to_ts   = from_ts + scaled_frames
 
             # Clamp to recording bounds
             end_timestamp = self._start_timestamp + self._duration_frames
@@ -206,10 +170,10 @@ class PlaybackProducerWorker(BaseProducerWorker):
             frame_count = to_ts - from_ts
             frames = self._read_frames(from_ts, frame_count)
 
-            # Read spikes (using base class utility with timestamp offset)
+            # Read spikes (using helper with timestamp offset)
             relative_from = from_ts - self._start_timestamp
             relative_to   = to_ts - self._start_timestamp
-            spikes = self.read_spikes_in_range(
+            spikes        = self._read_spikes_in_range(
                 from_timestamp   = relative_from,
                 to_timestamp     = relative_to,
                 timestamp_offset = self._start_timestamp,
@@ -222,42 +186,49 @@ class PlaybackProducerWorker(BaseProducerWorker):
             datastream_events = self._read_datastream_events(from_ts, to_ts)
 
             # Write to shared buffer
-            self._buffer.write_frames(frames, from_ts)
+            # Spikes, stims, and datastream events are written before frames so that
+            # write_timestamp only advances after all associated data for this tick
+            # is committed. This ensures wait_for_timestamp() returns only when all
+            # data is visible.
             self.write_spikes_to_buffer(spikes)
             self.write_stims_to_buffer(stims)
             for ds_event in datastream_events:
                 self._buffer.write_datastream_event(ds_event)
+            self._buffer.stim_write_timestamp = to_ts
+            self._buffer.write_frames(frames, from_ts)
 
             # Explicit cleanup with GC disabled
             del frames, spikes, stims, datastream_events
 
-            # Sleep until next tick
-            tick_count += 1
+            # Sleep until next tick (then advance timestamp)
             self.sleep_until_next_tick(start_wall_ns, tick_count)
-
-            # Advance timestamp
             self._current_timestamp = to_ts
+            tick_count += 1
 
         # Cleanup using base class utility
         self.cleanup()
 
     def _process_commands(self) -> None:
-        """Process commands from the main process."""
-        while True:
-            cmd = self.get_next_command()
-            if cmd is None:
-                break
+        """Handle playback controls published through shared memory."""
+        super()._process_commands()
+        if self._buffer is None:
+            return
 
-            match cmd:
-                case SeekCommand():
-                    self._seek_to(cmd.target_timestamp)
-                case SetPausedCommand():
-                    self._paused = cmd.paused
-                    if self._buffer:
-                        self._buffer.pause_flag = cmd.paused
-                    _logger.info("Playback %s", "paused" if cmd.paused else "resumed")
-                case ShutdownCommand():
-                    self._running = False
+        seek_sequence = self._buffer.playback_seek_sequence
+        if seek_sequence != self._last_seek_sequence:
+            self._last_seek_sequence = seek_sequence
+            if seek_sequence != 0:
+                self._seek_to(self._buffer.playback_seek_timestamp)
+
+        paused = self._buffer.pause_flag
+        if paused != self._paused:
+            self._paused = paused
+            _logger.info("Playback %s", "paused" if paused else "resumed")
+
+        speed = self._buffer.playback_speed
+        if speed != self._speed:
+            self._speed = max(0.25, min(4.0, speed))
+            _logger.info("Playback speed set to %.2fx", self._speed)
 
     def _seek_to(self, target_timestamp: int) -> None:
         """Seek to the specified timestamp."""
@@ -273,9 +244,69 @@ class PlaybackProducerWorker(BaseProducerWorker):
         if self._buffer:
             self._buffer.reset_to_timestamp(target_timestamp)
 
+    def _open_replay_file(self) -> None:
+        """Open the replay H5 file and set up samples/spikes references."""
+        from cl.util import RecordingView
+        self._recording_view = RecordingView(self._replay_file_path)
+        self._replay_file    = self._recording_view.file
+
+    def _load_spike_timestamps(self) -> None:
+        """Load spike timestamps into memory for efficient binary search."""
+        if self._recording_view is None or self._recording_view.spikes is None:
+            self._spike_timestamps = np.array([], dtype=np.int64)
+            return
+
+        spikes = self._recording_view.spikes
+        try:
+            # Vectorized column read - much faster for PyTables Tables
+            self._spike_timestamps = spikes.col('timestamp').astype(np.int64)
+        except (AttributeError, KeyError):
+            # Fallback for non-Table node types
+            spike_count = len(spikes)
+            self._spike_timestamps = np.zeros(spike_count, dtype=np.int64)
+            for i in range(spike_count):
+                self._spike_timestamps[i] = int(spikes[i]["timestamp"])
+
+    def _read_spikes_in_range(
+        self,
+        from_timestamp  : int,
+        to_timestamp    : int,
+        timestamp_offset: int = 0,
+    ) -> list[SpikeRecord]:
+        """Read spikes from the replay file within a timestamp range."""
+        if (
+            self._recording_view is None or
+            self._recording_view.spikes is None or
+            self._spike_timestamps is None or
+            len(self._spike_timestamps) == 0
+        ):
+            return []
+
+        left_idx  = np.searchsorted(self._spike_timestamps, from_timestamp, side="left")
+        right_idx = np.searchsorted(self._spike_timestamps, to_timestamp,   side="left")
+
+        result = []
+        for i in range(left_idx, right_idx):
+            spike = self._recording_view.spikes[i]
+            result.append(SpikeRecord(
+                timestamp           = int(spike["timestamp"]) + timestamp_offset,
+                channel             = int(spike["channel"]),
+                channel_mean_sample = 0.0,  # Not typically stored in recording
+                samples             = np.array(spike["samples"], dtype=np.float32)
+            ))
+
+        return result
+
+    def cleanup(self) -> None:
+        if self._recording_view is not None:
+            self._recording_view.close()
+            self._recording_view = None
+        self._replay_file = None  # Already closed by recording_view.close() above
+        super().cleanup()
+
     def _load_stims_and_datastreams(self) -> None:
         """Load stim and datastream references from the replay file."""
-        # Base class already opened the file and set _replay_file, _replay_samples, _replay_spikes
+        # _open_replay_file already set _replay_file
         assert self._replay_file is not None
 
         # Get stims (optional)
@@ -298,11 +329,14 @@ class PlaybackProducerWorker(BaseProducerWorker):
             self._stim_timestamps = np.array([], dtype=np.int64)
             return
 
-        stim_count = len(self._replay_stims)
-        self._stim_timestamps = np.zeros(stim_count, dtype=np.int64)
-
-        for i in range(stim_count):
-            self._stim_timestamps[i] = int(self._replay_stims[i]["timestamp"])
+        try:
+            # Vectorized column read - much faster for PyTables Tables
+            self._stim_timestamps = self._replay_stims.col('timestamp').astype(np.int64)
+        except (AttributeError, KeyError):
+            stim_count = len(self._replay_stims)
+            self._stim_timestamps = np.zeros(stim_count, dtype=np.int64)
+            for i in range(stim_count):
+                self._stim_timestamps[i] = int(self._replay_stims[i]["timestamp"])
 
     def _load_datastream_indices(self) -> None:
         """Load datastream timestamp indices for efficient searching."""
@@ -312,19 +346,22 @@ class PlaybackProducerWorker(BaseProducerWorker):
             return
 
         # Access _v_children is the PyTables way to iterate child groups
-        for ds_name in self._replay_data_streams._v_children:  # noqa: SLF001
+        for ds_name in self._replay_data_streams._v_children:
             ds_group = self._replay_data_streams[ds_name]
             if hasattr(ds_group, 'index'):
-                # Load timestamps for this data stream
                 index_table = ds_group.index
-                timestamps = np.zeros(len(index_table), dtype=np.int64)
-                for i, row in enumerate(index_table):
-                    timestamps[i] = int(row["timestamp"])
+                try:
+                    # Vectorized column read - much faster for PyTables Tables
+                    timestamps = index_table.col('timestamp').astype(np.int64)
+                except (AttributeError, KeyError):
+                    timestamps = np.zeros(len(index_table), dtype=np.int64)
+                    for i, row in enumerate(index_table):
+                        timestamps[i] = int(row["timestamp"])
                 self._datastream_indices[ds_name] = timestamps
 
     def _read_frames(self, from_timestamp: int, frame_count: int) -> np.ndarray:
         """Read frames from the replay file."""
-        if self._replay_samples is None:
+        if self._recording_view is None or self._recording_view.samples is None:
             return np.zeros((frame_count, self._channel_count), dtype=np.int16)
 
         # Convert timestamp to file index (timestamps are relative to start)
@@ -339,7 +376,7 @@ class PlaybackProducerWorker(BaseProducerWorker):
         if start_idx >= end_idx:
             return np.zeros((frame_count, self._channel_count), dtype=np.int16)
 
-        return np.array(self._replay_samples[start_idx:end_idx], dtype=np.int16)
+        return np.array(self._recording_view.samples[start_idx:end_idx], dtype=np.int16)
 
     def _read_stims(self, from_timestamp: int, to_timestamp: int) -> list[StimRecord]:
         """Read stims from the replay file for the given timestamp range."""
@@ -360,8 +397,9 @@ class PlaybackProducerWorker(BaseProducerWorker):
             # Convert relative timestamp back to absolute
             absolute_ts = int(stim["timestamp"]) + self._start_timestamp
             result.append(StimRecord(
-                timestamp = absolute_ts,
-                channel   = int(stim["channel"])
+                timestamp          = absolute_ts,
+                intended_timestamp = absolute_ts,          # For playback, intended timestamp is always the same as actual
+                channel            = int(stim["channel"])
             ))
 
         return result
@@ -443,68 +481,67 @@ class PlaybackProducer(BaseProducer):
         tick_rate_hz     : int = DEFAULT_TICK_RATE_HZ,
     ):
         super().__init__(
-            replay_file_path  = replay_file_path,
             channel_count     = channel_count,
             frames_per_second = frames_per_second,
+            start_timestamp   = start_timestamp,
+            duration_frames   = duration_frames,
+            tick_rate_hz      = tick_rate_hz,
         )
+        self._replay_file_path = str(replay_file_path) if isinstance(replay_file_path, Path) else replay_file_path
 
-        self._duration_frames   = duration_frames
-        self._start_timestamp   = start_timestamp
-        self._tick_rate_hz      = tick_rate_hz
-
-    def _create_process(self) -> Process:
+    def _create_process(self) -> PopenProcess:
         """Create the playback producer subprocess."""
-        return Process(
-            target = _producer_main,
-            args   = (
-                self._replay_file_path,
-                self._channel_count,
-                self._frames_per_second,
-                self._duration_frames,
-                self._start_timestamp,
-                self._tick_rate_hz,
-                self._command_queue,
-                self._name_prefix,
-            ),
-            daemon = True,
+        assert self._name_prefix is not None
+        return PopenProcess(
+            target       = "cl._sim.playback._playback_producer:run_from_config",
+            process_name = "cl-playback-producer",
+            config       = {
+                "replay_file_path" : self._replay_file_path,
+                "channel_count"    : self._channel_count,
+                "frames_per_second": self._frames_per_second,
+                "duration_frames"  : self._duration_frames,
+                "start_timestamp"  : self._start_timestamp,
+                "tick_rate_hz"     : self._tick_rate_hz,
+                "name_prefix"      : self._name_prefix,
+            },
         )
-
-    def _send_shutdown(self) -> None:
-        """Send shutdown command to the subprocess."""
-        self._command_queue.put(ShutdownCommand())
-
-    def start(self, timeout: float = 15.0, start_timestamp: int = 0) -> None:  # noqa: ARG002
-        """Start the producer subprocess."""
-        # Use base class start with our start_timestamp (ignore parameter)
-        super().start(timeout=timeout, start_timestamp=self._start_timestamp)
 
     def set_paused(self, paused: bool) -> None:
         """Set the pause state (override to send command to subprocess)."""
-        self._command_queue.put(SetPausedCommand(paused=paused))
-        # Also use base class method to update buffer
         super().set_paused(paused)
 
     def seek_to(self, timestamp: int) -> None:
         """Seek to the specified timestamp."""
-        self._command_queue.put(SeekCommand(target_timestamp=timestamp))
+        if self._buffer:
+            self._buffer.request_playback_seek(timestamp)
 
     def seek_relative(self, delta_frames: int) -> None:
         """Seek relative to current position by delta_frames."""
-        # Use base class current_timestamp property
         current_ts = self.current_timestamp
         self.seek_to(current_ts + delta_frames)
 
-    @property
-    def duration_frames(self) -> int:
-        """Get total duration in frames."""
-        return self._duration_frames
+    def set_speed(self, speed: float) -> None:
+        """Set the playback speed (0.25 to 4.0)."""
+        if self._buffer:
+            self._buffer.playback_speed = speed
 
     @property
-    def start_timestamp(self) -> int:
-        """Get the recording start timestamp."""
-        return self._start_timestamp
+    def playback_speed(self) -> float:
+        """Get the current playback speed from the buffer."""
+        if self._buffer:
+            return self._buffer.playback_speed
+        return 1.0
 
-    @property
-    def end_timestamp(self) -> int:
-        """Get the recording end timestamp."""
-        return self._start_timestamp + self._duration_frames
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the CL SDK playback producer subprocess")
+    parser.add_argument("--process-name", default="cl-playback-producer")
+    parser.add_argument("--config-json", required=True)
+    args = parser.parse_args()
+    config = json.loads(args.config_json)
+    run_from_config(config)
+
+def run_from_config(config: dict) -> None:
+    _producer_main(**config)
+
+if __name__ == "__main__":
+    main()

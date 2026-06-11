@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Generator, Sequence
+import os
+import warnings
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
-from typing import Any, Self, overload
+from typing import Any, Final, overload
 
 import numpy as np
+from dotenv import load_dotenv
+
+_FRAME_TIME_US = 20
 
 _logger = logging.getLogger("cl")
 """ (Simulator) Logger for debugging purposes. """
+
+# Read possible variables from .env file
+load_dotenv()
 
 class Stim:
     """
@@ -232,22 +240,28 @@ class ChannelSet:
     _channels: np.ndarray[Any, np.dtype[np.bool]]
     """ (Simulator only) Current channels in the set. """
 
-    def __init__(self, *channels) -> None:
+    def __init__(self, *channels: int | Iterable[int]) -> None:
         """ Constructor for ChannelSet. """
-        if len(channels) < 1:
-            raise TypeError("ChannelSet requires at least one channel")
         self._channels = np.zeros(self._CHANNELS_TOTAL, np.bool)
-        if len(channels) == 1 and isinstance(channels[0], Sequence):
-            _channels = channels[0]
-        else:
-            _channels = channels
-        for channel in _channels:
+        flattened_chs: list[int] = []
+        for ch in channels:
+            if isinstance(ch, int):
+                flattened_chs.append(ch)
+            elif isinstance(ch, Iterable):
+                for sub_ch in ch:
+                    if not isinstance(sub_ch, int):
+                        raise TypeError("Channels within tuples and lists must be ints")
+                    flattened_chs.append(sub_ch)
+            else:
+                raise TypeError("channels must be an int, list or tuple")
+
+        for channel in flattened_chs:
             self._add_channels(channel)
 
     def _add_channels(self, channel: int) -> None:
         """ (Simulator only) Adds a channel to this ChannelSet. """
-        assert isinstance(channel, int), "Channels must be integers"
-        assert 0 <= channel < self._CHANNELS_TOTAL, f"Channel number {channel} out of range"
+        if channel < 0 or channel >= self._CHANNELS_TOTAL:
+            raise ValueError(f"Channel number {channel} is out of range")
         self._channels[channel] = True
 
     def _check_operand_args(self, other: Any) -> ChannelSet:
@@ -256,55 +270,98 @@ class ChannelSet:
             return other
         if isinstance(other, int):
             return ChannelSet(other)
-        if isinstance(other, list) | isinstance(other, tuple):
-            return ChannelSet(*other)
-        raise TypeError("Channels must be an int, list or tuple")
-
-    def _iterate_channels(self) -> Generator[int]:
-        """ (Simulator only) Iterates over sorted channels in this ChannelSet. """
-        for channel in sorted(np.where(self._channels)[0]):
-            yield int(channel)
+        try:
+            if isinstance(other, Iterable):
+                return ChannelSet(*other)
+        except TypeError:
+            # other is an Iterable but its contents are not valid for ChannelSet construction
+            # In this case, we want to raise the below TypeError rather than the one from ChannelSet.__init__ to mimic device behaviour
+            pass
+        raise TypeError(f"type {type(other)} cannot be added to a ChannelSet")
 
     def _tolist(self) -> list[int]:
         """ (Simulator only) Returns the channels in this ChannelSet as a list. """
         return np.flatnonzero(self._channels).tolist()
 
-    def __and__(self, other: ChannelSet | Sequence[int]) -> Self:
+    def _is_empty(self) -> bool:
+        """ (Simulator only) Returns True if this ChannelSet is empty. """
+        return not np.any(self._channels)
+
+    def _count(self) -> int:
+        """ (Simulator only) Returns the number of channels in this ChannelSet. """
+        return int(np.sum(self._channels))
+
+    @classmethod
+    def _from_array(cls, channels: np.ndarray) -> ChannelSet:
+        """ (Simulator only) Constructs a ChannelSet directly from a bool array, bypassing argument validation. """
+        instance = object.__new__(cls)
+        instance._channels = channels
+        return instance
+
+    def __and__(self, other: ChannelSet | Iterable[int]) -> ChannelSet:
         """
         Performs an AND operation between the channels between this ChannelSet
         and either another ChannelSet or iterable containing channels.
         """
         other = self._check_operand_args(other)
-        self._channels = np.logical_and(self._channels, other._channels)
+        return ChannelSet._from_array(np.logical_and(self._channels, other._channels))
+
+    def __iand__(self, other: ChannelSet | Iterable[int]) -> ChannelSet:
+        """
+        Performs an in-place AND operation between the channels between this ChannelSet
+        and either another ChannelSet or iterable containing channels.
+        """
+        other = self._check_operand_args(other)
+        np.logical_and(self._channels, other._channels, out=self._channels)
         return self
 
-    def __or__(self, other: ChannelSet | Sequence[int]) -> Self:
+    def __or__(self, other: ChannelSet | Iterable[int]) -> ChannelSet:
         """
         Performs a OR operation between the channels between this ChannelSet
         and either another ChannelSet or iterable containing channels.
         """
         other = self._check_operand_args(other)
-        self._channels = np.logical_or(self._channels, other._channels)
+        return ChannelSet._from_array(np.logical_or(self._channels, other._channels))
+
+    def __ior__(self, other: ChannelSet | Iterable[int]) -> ChannelSet:
+        """
+        Performs an in-place OR operation between the channels between this ChannelSet
+        and either another ChannelSet or iterable containing channels.
+        """
+        other = self._check_operand_args(other)
+        np.logical_or(self._channels, other._channels, out=self._channels)
         return self
 
-    def __xor__(self, other: ChannelSet | Sequence[int]) -> Self:
+    def __xor__(self, other: ChannelSet | Iterable[int]) -> ChannelSet:
         """
         Performs a XOR operation between the channels between this ChannelSet
         and either another ChannelSet or iterable containing channels.
         """
         other = self._check_operand_args(other)
-        self._channels = np.logical_xor(self._channels, other._channels)
+        return ChannelSet._from_array(np.logical_xor(self._channels, other._channels))
+
+    def __ixor__(self, other: ChannelSet | Iterable[int]) -> ChannelSet:
+        """
+        Performs an in-place XOR operation between the channels between this ChannelSet
+        and either another ChannelSet or iterable containing channels.
+        """
+        other = self._check_operand_args(other)
+        np.logical_xor(self._channels, other._channels, out=self._channels)
         return self
 
-    def __invert__(self) -> Self:
+    def __invert__(self) -> ChannelSet:
         """
         Inverts the channels within this ChannelSet
         """
-        self._channels = ~self._channels
-        return self
+        return ChannelSet._from_array(np.logical_not(self._channels))
 
     def __repr__(self) -> str:
-        return f"ChannelSet{tuple(self._iterate_channels())}"
+        return f"ChannelSet({', '.join(map(str, self))})"
+
+    def __iter__(self) -> Generator[int]:
+        """ Iterates over channels in this ChannelSet. """
+        for channel in sorted(np.where(self._channels)[0]):
+            yield int(channel)
 
 class StimDesign:
     """
@@ -385,20 +442,32 @@ class StimDesign:
 
     def __init__(self, *args) -> None:
         """ Constructor for StimDesign. """
-        if not len(args) in [2, 4, 6]:
+        if len(args) not in {2, 4, 6}:
             raise ValueError("StimDesign requires 2, 4, or 6 arguments.")
-        durations = args[ ::2] # args indices [0, 2, 4]
-        currents  = args[1::2] # args indices [1, 3, 5]
+        durations: tuple[int, ...]   = args[ ::2]  # args indices [0, 2, 4]
+        currents:  tuple[float, ...] = args[1::2]  # args indices [1, 3, 5]
         self._validate(durations, currents)
         self.duration_us = sum(durations)
         self._args       = args
+
+        self._num_phases = len(durations)
+        self._padded_durations = (
+            durations[0],
+            durations[1] if self._num_phases > 1 else 0,
+            durations[2] if self._num_phases > 2 else 0,
+        )
+        self._padded_currents  = (
+            currents[0],
+            currents[1] if self._num_phases > 1 else 0.0,
+            currents[2] if self._num_phases > 2 else 0.0,
+        )
 
     def _validate(self, durations, currents) -> None:
         """ (Simulator only) Validate the stim and raise a ValueError if needed. """
         for i, (duration_us, current_uA) in enumerate(zip(durations, currents)):
             # Total charge
             charge_pC = current_uA * duration_us
-            if charge_pC > self._PHASE_CHARGE_INJECTION_LIMIT_PC:
+            if abs(charge_pC) > self._PHASE_CHARGE_INJECTION_LIMIT_PC:
                 raise ValueError(
                     f"Charge injection of "
                     f"{duration_us} us x {current_uA} uA = {charge_pC / 1000} nC "
@@ -409,7 +478,7 @@ class StimDesign:
             if not (abs(current_uA) <= self._CURRENT_LIMIT_UA):
                 raise ValueError(
                     f"Stim current of {current_uA:.3f} uA "
-                    f"cannot be {"less" if current_uA < 0 else "greater"} than "
+                    f"cannot be {'less' if current_uA < 0 else 'greater'} than "
                     f"{-self._CURRENT_LIMIT_UA if current_uA < 0 else self._CURRENT_LIMIT_UA:.3f} uA."
                     )
             if (i > 0) and (np.sign(currents[i-1]) == np.sign(currents[i])):
@@ -429,6 +498,10 @@ class StimDesign:
                     f"duration_us_{i+1} "
                     f"must be evenly divisible by {self._DURATION_BIN_US}"
                 )
+
+    def _get_padded(self) -> tuple[tuple[int, int, int], tuple[float, float, float], int]:
+        """ (Simulator only) Returns the durations and currents padded to 3 phases, and the number of phases. """
+        return self._padded_durations, self._padded_currents, self._num_phases
 
     def __repr__(self) -> str:
         return f"StimDesign{tuple(self._args)}"
@@ -461,7 +534,7 @@ class BurstDesign:
     _burst_interval_us: int
     """ (Simulator only) Amount of time in microseconds (us) between each stim for this burst. """
 
-    _BURST_FREQUENCY_LIMIT_HZ: int = 200
+    _BURST_FREQUENCY_LIMIT_HZ: Final[int] = 200
     """ (Simulator only) Maximum allowable burst frequency. """
 
     def __init__(self, burst_count: int, burst_hz: float, /) -> None:
@@ -469,7 +542,7 @@ class BurstDesign:
         self._validate(burst_count, burst_hz)
         self._burst_count        = burst_count
         self._burst_requested_hz = burst_hz
-        self._burst_interval_us  = int(1 / burst_hz * 1e6)
+        self._burst_interval_us  = int((1_000_000 / burst_hz / _FRAME_TIME_US) + 0.5) * _FRAME_TIME_US
         self._args               = (burst_count, burst_hz)
 
     def _validate(self, burst_count: int, burst_hz: float) -> None:
@@ -486,12 +559,24 @@ class BurstDesign:
     def __repr__(self) -> str:
         return f"BurstDesign{tuple(self._args)}"
 
-from ._closed_loop import Loop, LoopTick
-from ._stim_plan import StimPlan
+from ._sim._closed_loop import Loop, LoopTick
+from ._sim._stim_plan import StimPlan
 from .neurons import Neurons
 from .util import RecordingView
 from .recording import Recording
 from .data_stream import DataStream
+from .error import (
+    ControlRequestError,
+    ControlRequiredError,
+    TransactionRejected,
+    ChannelQueueFull,
+    SyncLimitExceeded,
+    RunTimestampOrderError,
+    DeferredInterruptLimitExceeded,
+    RecordingFailedError,
+    WsApiError,
+    UnsafeOperationError
+)
 
 @contextmanager
 def open(take_control: bool = True, wait_until_recordable: bool = True) -> Generator[Neurons]:
@@ -519,9 +604,8 @@ def open(take_control: bool = True, wait_until_recordable: bool = True) -> Gener
     ```
     """
     import gc
-    import os
 
-    with Neurons() as neurons:
+    with Neurons._get_instance() as neurons:
         gc_was_enabled = False
 
         try:
@@ -546,12 +630,6 @@ def open(take_control: bool = True, wait_until_recordable: bool = True) -> Gener
             # The background recording system may not be ready immediately.
             if wait_until_recordable:
                 neurons.wait_until_recordable()
-
-            # Start WebSocket server if enabled via environment variable
-            if os.getenv("CL_SDK_WEBSOCKET", "0") == "1":
-                port = int(os.getenv("CL_SDK_WEBSOCKET_PORT", "1025"))
-                host = os.getenv("CL_SDK_WEBSOCKET_HOST", "127.0.0.1")
-                neurons._start_websocket_server(port=port, host=host)
 
             yield neurons
 
@@ -590,177 +668,22 @@ def get_system_attributes() -> dict[str, Any]:
         "hostname"      : socket.gethostname(),
     }
 
-#
-# Manages replay recordings per session
-#
-
-_CL_SDK_REPLAY_PATH: str | None = None
-""" (Simulator only) Path to the recording to be replayed, persisting each session. """
-
-def _generate_random_recording(
-    sample_mean:      float,
-    spike_percentile: float,
-    duration_sec:     float,
-    random_seed:      int
-    ) -> str:
+def is_simulator() -> bool:
     """
-    Generate a temporary recording by sampling from a Poisson distribution.
-    Spikes are generated when the sample value exceeds a percentile threshold.
-
-    Args:
-        sample_mean:      Lambda value for the Poisson distribution.
-        spike_percentile: Spikes are generated when the sample value exceeds
-                          this percentile threshold.
-        duration_sec:     Duration of the recording.
-        random_seed:      Seed for the random number generator.
-
-    Returns:
-        File path to the temporary recording that can be used by cl_mock.
+    Returns True if running in the simulator environment, False if running on a real device.
     """
-    import atexit
-    from tempfile import TemporaryDirectory
-    from .recording import Recording
-
-    _logger.debug(
-        f"generating a temporary {duration_sec:2f} sec recording, "
-        f"with mean sample value = {sample_mean}, "
-        f"spike percentile = {spike_percentile}"
-        )
-
-    # Create a temporary directory and register for it to be automatically cleanedup
-    temp_recording_dir = TemporaryDirectory(delete=True)
-    atexit.register(temp_recording_dir.cleanup)
-
-    # Define recording attributes
-    channel_count      = 64
-    frames_per_second  = 25_000
-    sampling_frequency = frames_per_second
-    uV_per_sample_unit = 0.195
-
-    # Define timing attributes
-    duration_frames = int(duration_sec * frames_per_second)
-
-    # Here, we need to create a FakeNeurons class to pass to our Recording
-    # in order to generate a temporary random recording to use with Neurons.
-    class FakeNeurons:
-
-        _timestamp:         int             = 0
-        _read_timestamp:    int             = 0
-        _frames_per_second: int             = 25_000
-        _recordings:        list[Recording] = []
-
-        def timestamp(self) -> int:
-            return self._timestamp
-
-        def get_frames_per_second(self) -> int:
-            return self._frames_per_second
-
-    fake_neurons = FakeNeurons()
-
-    # Create random number generator
-    rng = np.random.RandomState(random_seed)
-
-    # Generate samples by sampling from Poisson distribution
-    samples: np.ndarray = rng.poisson(sample_mean, size=(duration_frames, channel_count)).astype(np.int16) - sample_mean
-
-    # Generate spikes by sampling from Poisson distribution
-    spike_threshold: float = float(np.percentile(samples, spike_percentile))
-    spike_frames, spike_channels = np.where(samples > spike_threshold)
-    generated_spikes: list[Spike] = []
-    for frame, channel in zip(spike_frames, spike_channels, strict=True):
-        if (frame < 25 or frame > (duration_frames - 50)):
-            # Spikes require samples from at least 25 frames before and
-            # 50 frames after the spike timestamp
-            continue
-        i = frame - 25
-        j = frame + 50
-        spike = Spike(
-            timestamp           = fake_neurons.timestamp() + frame,
-            channel             = channel,
-            samples             = (samples[i:j, channel] * uV_per_sample_unit).astype(np.float32),
-            channel_mean_sample = sample_mean
-            )
-        generated_spikes.append(spike)
-
-    # Instantiate a new recording
-    temp_recording = Recording(
-        _neurons            = fake_neurons,
-        _channel_count      = channel_count,
-        _sampling_frequency = sampling_frequency,
-        _frames_per_second  = frames_per_second,
-        _uV_per_sample_unit = uV_per_sample_unit,
-        _data_streams       = {},
-        file_location       = temp_recording_dir.name
-        )
-
-    # Push the generated data to the recording
-    temp_recording._write_samples(samples)
-    temp_recording._write_spikes(generated_spikes)
-
-    # Increment our timestamp then close the recording
-    fake_neurons._timestamp     += duration_frames
-    fake_neurons._read_timestamp = fake_neurons._timestamp
-    temp_recording.stop()
-    temp_recording.wait_until_stopped()
-    return temp_recording.file["path"]
-
-def _load_h5_recording() -> None:
-    """
-    Loads a H5 recording so that it can be replayed. The path of the recording
-    is determined by the CL_SDK_REPLAY_PATH environment variable that is
-    contained with a .env file.
-
-    If CL_SDK_REPLAY_PATH is not provided, a temporary recording will be
-    generated where spikes and samples are sampled from a Poisson distribution.
-    The following environment variables can be optionally provided:
-    - CL_SDK_SAMPLE_MEAN     : Mean samples value (default 170).
-    - CL_SDK_SPIKE_PERCENTILE: Percentile threshold of samples values, above
-                                which will correspond to a spike (default 99.995).
-    - CL_SDK_DURATION_SEC    : Duration of the temporary recording (default 60).
-    - CL_SDK_RANDOM_SEED     : Random seed (defaults to Unix time).
-    """
-    import os
-    import time
-    from pathlib import Path
-    from dotenv import load_dotenv
-
-    global _CL_SDK_REPLAY_PATH
-
-    # Read possible variables from .env file
-    load_dotenv(".env")
-
-    # User defined replay path will always take precedence.
-    if _CL_SDK_REPLAY_PATH is None:
-        _CL_SDK_REPLAY_PATH = os.getenv("CL_SDK_REPLAY_PATH", None)
-
-    # If a replay recording is not provided, we generate a temporary one using random sampling
-    if _CL_SDK_REPLAY_PATH is None:
-        sample_mean      = int(os.getenv("CL_SDK_SAMPLE_MEAN", 170))
-        spike_percentile = float(os.getenv("CL_SDK_SPIKE_PERCENTILE", 99.995))
-        duration_sec     = float(os.getenv("CL_SDK_DURATION_SEC", 60))
-        random_seed      = int(os.getenv("CL_SDK_RANDOM_SEED", time.time()))
-        _CL_SDK_REPLAY_PATH = \
-            _generate_random_recording(
-                sample_mean      = sample_mean,
-                spike_percentile = spike_percentile,
-                duration_sec     = duration_sec,
-                random_seed      = random_seed
-                )
-
-    # Load the replay recording
-    assert Path(_CL_SDK_REPLAY_PATH).exists(), f"Recording not found: {_CL_SDK_REPLAY_PATH}"
-    return
-
-_load_h5_recording()
+    return True
 
 from . import app
 from . import analysis
+from . import sim
 from . import playback
 from . import visualisation
 
 __all__ = [
     "open",
     "get_system_attributes",
+    "is_simulator",
     "Neurons",
     "Stim",
     "Spike",
@@ -774,8 +697,19 @@ __all__ = [
     "Recording",
     "DataStream",
     "RecordingView",
+    "ControlRequestError",
+    "ControlRequiredError",
+    "TransactionRejected",
+    "ChannelQueueFull",
+    "SyncLimitExceeded",
+    "RunTimestampOrderError",
+    "DeferredInterruptLimitExceeded",
+    "RecordingFailedError",
+    "WsApiError",
+    "UnsafeOperationError",
     "app",
     "analysis",
+    "sim",
     "visualisation",
-    "playback"
+    "playback",
 ]

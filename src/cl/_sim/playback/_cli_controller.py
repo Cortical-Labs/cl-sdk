@@ -5,6 +5,7 @@ Provides an interactive command-line interface for controlling playback:
 - Space: Toggle pause/play
 - Left/Right arrows: Skip backward/forward 5 seconds
 - Shift+Left/Right (Unix) or Ctrl+Left/Right (Windows): Skip backward/forward 1 minute
+- Up/Down arrows: Increase/decrease playback speed by 0.25x
 - g: Go to specific timestamp
 - r: Restart from beginning
 - q: Quit
@@ -18,7 +19,7 @@ from typing import TYPE_CHECKING
 
 # Platform-specific imports
 if sys.platform == 'win32':
-    import msvcrt  # type: ignore[import-not-found]
+    import msvcrt
 else:
     import select
     import termios
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
 _STATUS_UPDATE_INTERVAL = 0.1  # Update every 100ms
 _MM_SS_PARTS            = 2
 _HH_MM_SS_PARTS         = 3
+_SPEED_MIN              = 0.25
+_SPEED_MAX              = 4.0
+_SPEED_STEP             = 0.25
 
 def _format_time(frames: int, fps: int) -> str:
     """Format frame count as HH:MM:SS.mmm."""
@@ -174,12 +178,14 @@ class PlaybackController:
         start    = self._producer.start_timestamp
         progress = (current - start) / self._duration_frames * 100 if self._duration_frames > 0 else 0
         state    = "⏸ PAUSED" if self._producer.is_paused else "▶ PLAYING"
+        speed    = self._producer.playback_speed
 
         current_str = _format_timestamp(current, start, self._fps)
         total_str   = _format_time(self._duration_frames, self._fps)
+        speed_str   = f"  [{speed:.2f}x]" if speed != 1.0 else ""
 
         # Clear line and print status
-        status_line = f"\r\033[K{state}  {current_str} / {total_str}  ({progress:5.1f}%)"
+        status_line = f"\r\033[K{state}{speed_str}  {current_str} / {total_str}  ({progress:5.1f}%)"
         if message:
             status_line += f"  | {message}"
         print(status_line, end="", flush=True)
@@ -197,6 +203,7 @@ class PlaybackController:
             "│      SPACE            Toggle pause/play             │",
             "│      ←/→              Skip ±5 seconds               │",
             f"│      {modifier_key:<16} Skip ±1 minute                │",
+            "│      ↑/↓              Speed up / slow down (±0.25x) │",
             "│      g                Go to timestamp (prompt)      │",
             "│      r                Restart from beginning        │",
             "│      h/?              Show this help                │",
@@ -279,6 +286,20 @@ class PlaybackController:
             # Skip forward 1 minute
             self._producer.seek_relative(60 * self._fps)
             self._print_status("▶▶ +1min")
+
+        elif key == 'up':
+            # Increase playback speed
+            current_speed = self._producer.playback_speed
+            new_speed = min(_SPEED_MAX, current_speed + _SPEED_STEP)
+            self._producer.set_speed(new_speed)
+            self._print_status(f"Speed: {new_speed:.2f}x")
+
+        elif key == 'down':
+            # Decrease playback speed
+            current_speed = self._producer.playback_speed
+            new_speed = max(_SPEED_MIN, current_speed - _SPEED_STEP)
+            self._producer.set_speed(new_speed)
+            self._print_status(f"Speed: {new_speed:.2f}x")
 
         elif key == 'r':
             # Restart

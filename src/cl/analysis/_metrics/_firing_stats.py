@@ -45,8 +45,9 @@ def _analyse_firing_stats(
     culture_var_firing      = var_firing_per_channel.mean()
     culture_max_firing      = firing_counts.max()
 
-    culture_ISI_mean        = np.nanmean(channel_ISI_mean)
-    culture_ISI_var         = np.nanvar(channel_ISI_mean)
+    channel_ISI_mean_valid  = channel_ISI_mean[~np.isnan(channel_ISI_mean)]
+    culture_ISI_mean        = float(np.nanmean(channel_ISI_mean)) if channel_ISI_mean_valid.size > 0 else float("nan") # Guard for RuntimeWarning when ISI is NaN for all channels
+    culture_ISI_var         = float(np.nanvar(channel_ISI_mean))  if channel_ISI_mean_valid.size > 0 else float("nan") # Guard for RuntimeWarning when ISI is NaN for all channels
 
     channel_ISI_mean        = np.nan_to_num(channel_ISI_mean, nan=0.0)
     channel_ISI_var         = np.nan_to_num(channel_ISI_var,  nan=0.0)
@@ -64,6 +65,6 @@ def _analyse_firing_stats(
         channel_ISI               = channel_ISI,
         channel_ISI_mean          = channel_ISI_mean.tolist(),
         channel_ISI_var           = channel_ISI_var.tolist(),
-        culture_ISI_mean          = culture_ISI_mean.item(),
-        culture_ISI_var           = culture_ISI_var.item()
+        culture_ISI_mean          = culture_ISI_mean,
+        culture_ISI_var           = culture_ISI_var
         )

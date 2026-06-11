@@ -3,13 +3,27 @@ import pytest
 
 from inline_snapshot import snapshot
 
+# Disable websocket for tests, needs to be set before importing cl
+os.environ["CL_SDK_VISUALISATION"] = "0"
+
 import cl
-from cl import Neurons, Stim, ChannelSet, StimDesign, BurstDesign, StimPlan
+from cl import Stim, ChannelSet, StimDesign, BurstDesign, StimPlan
+
+from ..conftest import cleanup
+
+GROUNDED_CHANNELS = {0, 7, 56, 63}
 
 def test_channel_set():
-    with pytest.raises(TypeError):
-        channels = []
-        channel_set = ChannelSet(*channels)
+    bad_channel_sets = [
+        [-1],
+        [64],
+        [1.5],
+        ["1"],
+        [1, [2, [3, 4]]],
+    ]
+    for bad_set in bad_channel_sets:
+        with pytest.raises((ValueError, TypeError)):
+            ChannelSet(*bad_set)
 
 def test_stim_design():
 
@@ -62,13 +76,13 @@ def test_stim():
     with cl.open() as neurons:
         neurons._elapsed_frames = 0
 
-        frames_per_second   = neurons._frames_per_second
+        frames_per_second   = neurons.get_frames_per_second()
 
         lead_time_us        = 80
         lead_time_frames    = int(lead_time_us / 1e6 * frames_per_second)
 
         pulse_width_us      = 160
-        biphasic_frames     = int(2 * pulse_width_us / 1e6 * frames_per_second)
+        biphasic_frames     = 125 - 2  # A single biphasic pulse defaults to a 200 Hz frequency i.e. 125 frames @ 25kHz. -2 frames for lead time.
 
         burst_hz            = 100
         inter_burst_frames  = int(1 / burst_hz * frames_per_second)
@@ -129,14 +143,6 @@ def test_stim():
                         + lead_time_frames
                         )
                     ),
-                Stim( # (Stim call 2)
-                    channel=9,
-                    timestamp=(
-                        start_timestamp
-                        + tick_frames
-                        + lead_time_frames
-                        )
-                    ),
                 Stim( # (Stim call 3)
                     channel=16,
                     timestamp=(
@@ -153,7 +159,9 @@ def test_stim():
                         + lead_time_frames
                         )
                     ),
-                Stim( # (Stim call 2) This is queued after Stim call 1
+            ],
+            2: [
+                Stim( # (Stim call 2) This is queued after Stim call 1 due to sync() inserted for multi-channel stims
                     channel=8,
                     timestamp=(
                         start_timestamp
@@ -163,8 +171,17 @@ def test_stim():
                         + lead_time_frames # Stim call 2
                         )
                     ),
+                Stim( # (Stim call 2) This is queued after Stim call 1 due to sync() inserted for multi-channel stims
+                    channel=9,
+                    timestamp=(
+                        start_timestamp
+                        + tick_frames
+                        + lead_time_frames # Stim call 1
+                        + biphasic_frames  # Stim call 1
+                        + lead_time_frames # Stim call 2
+                        )
+                    ),
             ],
-            2: [],
             3: [
                 Stim( # (Stim call 3)
                     channel=16,
@@ -187,6 +204,29 @@ def test_stim():
 
         assert expected_tick_stims == snapshot(observed_tick_stims)
 
+def test_stim_batch():
+
+    def test():
+        with cl.open() as neurons:
+            all_channels = set(range(neurons.get_channel_count())) - GROUNDED_CHANNELS
+
+            plan = neurons.create_stim_plan()
+            plan.stim(cl.ChannelSet(*all_channels), cl.StimDesign(40, 0.05))
+
+            now = neurons.timestamp()
+            plan.run()
+
+            analysis = neurons.read(10, now, analysis=True)
+            print(analysis.stims)
+
+            assert len(analysis.stims) == len(all_channels), f"Expected {len(all_channels)} stims, got {len(analysis.stims)}"
+
+    os.environ["CL_SDK_ACCELERATED_TIME"] = "0"
+    test()
+    cleanup()
+    os.environ["CL_SDK_ACCELERATED_TIME"] = "1"
+    test()
+
 def test_stim_bursts():
     """
     We do tests for a range of burst frequencies to ensure stim intervals
@@ -199,17 +239,17 @@ def test_stim_bursts():
     burst_frequencies_hz = [96, 100, 110, 151, 199]
     expected_frame_diffs = \
         {
-            96:  [260, 261, 260, 261, 260, 261, 260, 261, 260, 11],
-            100: [250, 250, 250, 250, 250, 250, 250, 250, 250, 10],
-            110: [227, 228, 227, 228, 227, 228, 227, 228, 227, 11],
-            151: [165, 166, 165, 166, 165, 166, 165, 166, 165, 11],
-            199: [125, 126, 125, 126, 125, 126, 125, 126, 125, 11]
+            96:  [260, 261, 260, 261, 260, 261, 260, 261, 260, 261],
+            100: [250, 250, 250, 250, 250, 250, 250, 250, 250, 250],
+            110: [227, 228, 227, 228, 227, 228, 227, 228, 227, 228],
+            151: [165, 166, 165, 166, 165, 166, 165, 166, 165, 166],
+            199: [125, 126, 125, 126, 125, 126, 125, 126, 125, 126]
         }
 
     for burst_frequency in burst_frequencies_hz:
         stims = []
         with cl.open() as neurons:
-            for tick in neurons.loop(ticks_per_second=ticks_per_second, stop_after_ticks=2):
+            for tick in neurons.loop(ticks_per_second=ticks_per_second, stop_after_ticks=3):
                 for stim in tick.analysis.stims:
                     stims.append(stim.timestamp)
 
@@ -218,7 +258,7 @@ def test_stim_bursts():
                     neurons.stim(8, -1)
 
         observed_frame_diffs = np.diff(stims)
-        assert np.allclose(observed_frame_diffs, expected_frame_diffs[burst_frequency])
+        np.testing.assert_allclose(observed_frame_diffs, expected_frame_diffs[burst_frequency])
 
 def test_invalid_stims():
     """
@@ -253,13 +293,13 @@ def test_stim_plan():
     with cl.open() as neurons:
         neurons._elapsed_frames = 0
 
-        frames_per_second = neurons._frames_per_second
+        frames_per_second = neurons.get_frames_per_second()
 
         lead_time_us       = 80
         lead_time_frames   = int(lead_time_us / 1e6 * frames_per_second)
 
         pulse_width_us     = 160
-        biphasic_frames    = int(2 * pulse_width_us / 1e6 * frames_per_second)
+        biphasic_frames    = 125 - 2  # A single biphasic pulse defaults to a 200 Hz frequency i.e. 125 frames @ 25kHz. -2 frames for lead time.
 
         burst_hz           = 100
         inter_burst_frames = int(1 / burst_hz * frames_per_second)
@@ -328,14 +368,6 @@ def test_stim_plan():
                         + lead_time_frames
                     )
                 ),
-                Stim( # (Stim call 2)
-                    channel   = 9,
-                    timestamp = (
-                        start_timestamp
-                        + tick_frames
-                        + lead_time_frames
-                    )
-                ),
                 Stim( # (Stim call 3)
                     channel   = 16,
                     timestamp = (
@@ -352,7 +384,9 @@ def test_stim_plan():
                         + lead_time_frames
                     )
                 ),
-                Stim( # (Stim call 2) This is queued after Stim call 1
+            ],
+            2: [
+                Stim( # (Stim call 2) This is queued after Stim call 1 due to sync() inserted for multi-channel stims
                     channel   = 8,
                     timestamp = (
                         start_timestamp
@@ -362,8 +396,17 @@ def test_stim_plan():
                         + lead_time_frames # Stim call 2
                     )
                 ),
+                Stim( # (Stim call 2) This is queued after Stim call 1 due to sync() inserted for multi-channel stims
+                    channel   = 9,
+                    timestamp = (
+                        start_timestamp
+                        + tick_frames
+                        + lead_time_frames # Stim call 1
+                        + biphasic_frames  # Stim call 1
+                        + lead_time_frames # Stim call 2
+                    )
+                ),
             ],
-            2: [],
             3: [
                 Stim( # (Stim call 3)
                     channel   = 16,
@@ -403,7 +446,7 @@ def test_interrupt():
     with cl.open() as neurons:
         neurons._elapsed_frames = 0
 
-        frames_per_second = neurons._frames_per_second
+        frames_per_second = neurons.get_frames_per_second()
 
         lead_time_us      = 80
         lead_time_frames  = int(lead_time_us / 1e6 * frames_per_second)
@@ -576,7 +619,7 @@ def test_interrupt_stimplan():
     with cl.open() as neurons:
         neurons._elapsed_frames = 0
 
-        frames_per_second = neurons._frames_per_second
+        frames_per_second = neurons.get_frames_per_second()
 
         lead_time_us      = 80
         lead_time_frames  = int(lead_time_us / 1e6 * frames_per_second)
@@ -811,7 +854,8 @@ def test_stimplan_run_at_timestamp_with_interrupt():
                         plan_1.run(at_timestamp=now + 5000)
                         plan_2.run(at_timestamp=now + 15000)
 
-                neurons.interrupt(channel_set)
+                # Wait for all stims to arrive before doing analysis
+                neurons.sync(channel_set)
 
                 # Stims: ... A [Gap A] A [Gap A] A [ Gap A] B [Gap B] B [Gap B] B [Gap B] B
                 stim_ts_diff = np.diff(stims)
@@ -876,6 +920,51 @@ def test_neurons_sync():
         print(group_gap, group_1_stims)
         assert len(group_1_stims) == 3
         assert group_gap >= 1250
+
+def test_neurons_sync_more():
+    """
+    Additional test case for neurons sync, in non-accelerated mode.
+    """
+
+    os.environ["CL_SDK_ACCELERATED_TIME"] = "0"
+
+    import cl
+    from cl import ChannelSet, StimDesign, BurstDesign
+
+    channel_set_1 = ChannelSet(1)
+    channel_set_2 = ChannelSet(2)
+    channel_set_3 = ChannelSet(3)
+
+    stim_design   = StimDesign(80, -1.0)
+
+    expected_stim_channel_ts_offsets = [(1, 0), (3, 0)]
+    stims: list[tuple[int, int]] = []
+
+    first_stim_ts = None
+
+    with cl.open() as neurons:
+
+        for tick in neurons.loop(ticks_per_second=1, stop_after_ticks=2):
+            if tick.iteration==0:
+                stim_plan1 = neurons.create_stim_plan()
+                stim_plan1.stim(channel_set_1, stim_design, BurstDesign(1, 25000/125))
+                stim_plan1.sync(channel_set_1 | channel_set_2)
+                stim_plan1.sync(channel_set_2 | channel_set_3)
+                stim_plan1.stim(channel_set_3, stim_design)
+
+                ts = neurons.timestamp()
+                stim_plan1.run(at_timestamp=ts + 12_500)
+
+            for stim in tick.analysis.stims:
+                if first_stim_ts is None:
+                    first_stim_ts = stim.timestamp
+                stims.append((stim.channel, stim.timestamp - first_stim_ts))
+
+    for i, (channel, ts_offset) in enumerate(stims):
+        expected_channel, expected_offset = expected_stim_channel_ts_offsets[i]
+        print(f"Expected: {expected_channel, expected_offset}, Observed: {channel, ts_offset}")
+        assert channel == expected_channel, f"Expected channel {expected_channel} but got {channel}"
+        assert ts_offset == expected_offset, f"Expected timestamp offset {expected_offset} but got {ts_offset}"
 
 def test_stimplan_sync():
     """
@@ -956,5 +1045,5 @@ def test_stimplan_sync():
 
         pprint(stims)
         print(plan_2_sync_frame, last_stim_timestamp, last_stim_channels)
-        assert np.allclose(plan_2_sync_frame, last_stim_timestamp, atol=1)        # In case of half-frame alignment
-        assert np.allclose(np.sort(plan_2_channels), np.sort(last_stim_channels))
+        np.testing.assert_allclose(plan_2_sync_frame, last_stim_timestamp, atol=1)        # In case of half-frame alignment
+        np.testing.assert_allclose(np.sort(plan_2_channels), np.sort(last_stim_channels))

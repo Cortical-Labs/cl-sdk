@@ -1,63 +1,17 @@
 import time
 import os
-import pathlib
 
 import numpy as np
 
 import pytest
 
+from ..conftest import cleanup
+
+# Disable websocket for tests, needs to be set before importing cl
+os.environ["CL_SDK_VISUALISATION"] = "0"
+
 import cl
-from cl import Loop, LoopTick
-
-
-@pytest.fixture(autouse=True)
-def cleanup_shared_memory():
-    """Clean up any leaked shared memory before and after each test."""
-    def _cleanup():
-        import time
-        import subprocess
-        import sys
-        from multiprocessing.shared_memory import SharedMemory
-
-        # Kill any orphaned producer processes
-        # On Unix-like systems, use pkill to target the specific process by name
-        if sys.platform != 'win32':
-            try:
-                subprocess.run(['pkill', '-9', '-f', 'cl-data-producer'],
-                              capture_output=True, timeout=2)
-            except Exception:
-                pass
-        # On Windows: the OS will clean up child processes when the parent (pytest) exits.
-
-        # Give any lingering processes time to die
-        time.sleep(0.2)
-
-        # Clean up all shared memory segments matching the cl_sdk_ pattern
-        # These now have dynamic names with prefixes: cl_sdk_{prefix}_{segment}
-
-        # On Unix-like systems, shared memory files are in /dev/shm
-        if sys.platform != 'win32':
-            try:
-                shm_dir = pathlib.Path('/dev/shm')
-                if shm_dir.exists():
-                    for shm_file in shm_dir.glob('cl_sdk_*'):
-                        try:
-                            shm = SharedMemory(name=shm_file.name)
-                            shm.close()
-                            shm.unlink()
-                        except FileNotFoundError:
-                            pass
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-        # On Windows: shared memory cleanup is handled automatically when
-        # processes exit, so we don't need to do manual cleanup
-
-    _cleanup()
-    yield
-    _cleanup()
-
+from cl import Loop, LoopTick, DetectionResult
 
 def test_neurons_timestamp():
     """
@@ -68,10 +22,10 @@ def test_neurons_timestamp():
         neurons._elapsed_frames = 0
         wait_secs = 1.0
         start_ts  = neurons.timestamp()
-        time.sleep(wait_secs)
+        neurons.read(int(neurons.get_frames_per_second() * wait_secs), start_ts)
         end_ts    = neurons.timestamp()
-        duration_sec = (end_ts - start_ts) / neurons._frames_per_second
-        assert np.allclose(wait_secs, duration_sec, atol=0.1)
+        duration_sec = (end_ts - start_ts) / neurons.get_frames_per_second()
+        np.testing.assert_allclose(wait_secs, duration_sec, atol=0.1)
 
 def test_neurons_timestamp_accelerated():
     """
@@ -85,7 +39,7 @@ def test_neurons_timestamp_accelerated():
         start_ts = neurons.timestamp()
         time.sleep(wait_secs)
         end_ts   = neurons.timestamp()
-        duration_sec = (end_ts - start_ts) / neurons._frames_per_second
+        duration_sec = (end_ts - start_ts) / neurons.get_frames_per_second()
         assert duration_sec == 0
 
 # Read tolerance is 0 as it should always read the correct number of frames.
@@ -117,7 +71,7 @@ def test_neurons_read():
 
         # Test 2: Reading from > 5 secs in the past
         with pytest.raises(Exception):
-            neurons.read(frames_to_read, int(neurons.timestamp() - 5.5 * neurons._frames_per_second))
+            neurons.read(frames_to_read, int(neurons.timestamp() - 5.5 * neurons.get_frames_per_second()))
 
         # Test 3: Reading from past
         ts_offset      = -2600
@@ -169,7 +123,7 @@ def test_neurons_read_accelerated():
 
         # Test 2: Reading from > 5 secs in the past (exceeds buffer capacity)
         with pytest.raises(Exception):
-            neurons.read(frames_to_read, int(neurons.timestamp() - 5.5 * neurons._frames_per_second))
+            neurons.read(frames_to_read, int(neurons.timestamp() - 5.5 * neurons.get_frames_per_second()))
 
         # Test 3: Reading from past (within buffer)
         start_ts       = neurons.timestamp()
@@ -192,6 +146,42 @@ def test_neurons_read_accelerated():
 
         # In accelerated mode, reading into future advances producer to meet demand
         assert end_ts >= from_ts + frames_to_read
+
+def test_neurons_read_with_analysis():
+    """
+    This tests Neurons.loop(analysis=True) which returns DetectionResult
+    """
+    def _test():
+        with cl.open() as neurons:
+            stim_plan = neurons.create_stim_plan()
+            stim_plan.stim(3, -1.0)
+
+            timestamp        = neurons.timestamp()
+            offset_frames    = 500
+            num_frames       = offset_frames * 2
+            stim_lead_frames = 2
+            stim_plan_run_ts = timestamp + 1000
+            expected_stim_ts = stim_plan_run_ts + stim_lead_frames
+
+            stim_plan.run(at_timestamp=stim_plan_run_ts)
+
+            # To get both frames and analysis, call neurons.read twice
+            read_frames   = neurons.read(num_frames, stim_plan_run_ts)
+            read_analysis = neurons.read(num_frames, stim_plan_run_ts, analysis=True)
+
+            assert isinstance(read_frames, np.ndarray)
+            assert read_frames.shape[0] == num_frames
+
+            assert isinstance(read_analysis, DetectionResult)
+            assert len(read_analysis.stims) == 1
+            assert read_analysis.stims[0].timestamp == expected_stim_ts
+
+    # Test in both normal and accelerated modes
+    os.environ["CL_SDK_ACCELERATED_TIME"] = "0"
+    _test()
+    cleanup()  # Ensure clean state before next test
+    os.environ["CL_SDK_ACCELERATED_TIME"] = "1"
+    _test()
 
 def test_neurons_loop():
     """
@@ -222,7 +212,7 @@ def test_neurons_loop():
         tick = None
         for tick in neurons_loop:
             # Tick timestamps is always one iteration behind actual time
-            assert np.allclose(neurons.timestamp(), tick.iteration_timestamp, rtol=1000)
+            np.testing.assert_allclose(neurons.timestamp(), tick.iteration_timestamp, rtol=1000)
             assert tick.iteration_timestamp == tick.analysis.stop_timestamp
         assert tick is not None and tick.iteration == stop_after_ticks
 
@@ -236,14 +226,14 @@ def test_neurons_loop():
             pass
         stop_time_sec  = time.perf_counter()
         assert tick.iteration == (stop_after_seconds * ticks_per_second)
-        assert np.allclose(stop_time_sec - start_time_sec, stop_after_seconds, atol=0.1)
+        np.testing.assert_allclose(stop_time_sec - start_time_sec, stop_after_seconds, atol=0.1)
 
         # Test LoopTick
         neurons_loop: Loop = neurons.loop(ticks_per_second=ticks_per_second, stop_after_seconds=stop_after_seconds)
         for i, tick in enumerate(neurons_loop):
             assert tick.iteration < neurons_loop._stop_after_ticks
             assert tick.iteration == i
-            assert np.allclose(tick.analysis.start_timestamp, (int(neurons_loop.start_timestamp) + (i * frames_per_tick)), atol=1000)
+            np.testing.assert_allclose(tick.analysis.start_timestamp, (int(neurons_loop.start_timestamp) + (i * frames_per_tick)), atol=1000)
 
             assert tick.frames is not None
             assert tick.frames.shape == (frames_per_tick, replay_channels)
@@ -398,6 +388,39 @@ def test_neurons_loop_jitter_failures_accelerated():
                 if tick.iteration > 0:
                     break
 
+def _warm_up_producer(neurons, settle_seconds: float = 0.5) -> None:
+    """
+    Block until the real-time data producer is tracking wall-clock time 1:1.
+
+    The simulator's data producer runs in a subprocess and may perform heavy
+    one-shot work at startup (e.g. the random source calibrates a spike
+    threshold and generates its first second-long data block). Until that work
+    completes the producer runs behind real-time and then catches up faster than
+    real-time, so its timestamp-vs-wall-clock relationship is non-uniform. This
+    waits until the producer's timestamp advances at (approximately) the
+    real-time frame rate, indicating it has settled into steady-state pacing.
+    """
+    buffer = neurons._shared_buffer
+    assert buffer is not None
+    frames_per_second = neurons.get_frames_per_second()
+    deadline_ns       = time.perf_counter_ns() + int(settle_seconds * 1_000_000_000)
+    probe_seconds     = 0.02
+    consecutive_ok    = 0
+    while time.perf_counter_ns() < deadline_ns:
+        start_ts  = buffer.write_timestamp
+        start_ns  = time.perf_counter_ns()
+        time.sleep(probe_seconds)
+        advanced  = buffer.write_timestamp - start_ts
+        elapsed_s = (time.perf_counter_ns() - start_ns) / 1_000_000_000
+        rate      = advanced / elapsed_s if elapsed_s > 0 else 0
+        # Steady state: producer advances at ~real-time (not catching up faster).
+        if abs(rate - frames_per_second) <= frames_per_second * 0.05:
+            consecutive_ok += 1
+            if consecutive_ok >= 3:
+                return
+        else:
+            consecutive_ok = 0
+
 def test_neurons_loop_jitter_recovery():
     """
     This tests:
@@ -410,6 +433,7 @@ def test_neurons_loop_jitter_recovery():
     TICKS_PER_SECOND = 100
     FRAMES_PER_TICK  = 250
     STOP_AFTER_TICKS = 10
+    RESUME_AT_TICK   = 7
 
     tick_iterations         = []
     callback_tick_iteration = []
@@ -418,16 +442,52 @@ def test_neurons_loop_jitter_recovery():
 
     def handle_recovery_tick(tick: LoopTick):
         callback_tick_iteration.append(tick.iteration)
+        # Resume the (briefly frozen) producer once recovery is underway so the
+        # resumed ticks can read their data.
+        assert neurons._shared_buffer is not None
+        neurons._shared_buffer.pause_flag = False
 
     with cl.open() as neurons:
         neurons.restart()
+        # Let the data producer reach steady-state real-time before starting the
+        # timing-sensitive loop. The random data source does heavy one-shot work
+        # at startup (spike-threshold calibration + first-block generation), so
+        # the producer begins behind real-time and catches up at a non-uniform
+        # rate. If the loop captures its start timestamp during that catch-up
+        # phase, the jitter-recovery resume point becomes timing-dependent.
+        # Waiting until the producer is tracking wall-clock 1:1 makes the test
+        # deterministic (file replay needs no warm-up as its startup is trivial).
+        _warm_up_producer(neurons)
         for tick in neurons.loop(TICKS_PER_SECOND, stop_after_ticks=STOP_AFTER_TICKS):
             tick_iterations.append(tick.iteration)
             if (tick.iteration == 0):
                 first_tick_timestamp = tick.analysis.start_timestamp
             elif (tick.iteration == 1):
                 tick.loop.recover_from_jitter(handle_recovery_tick=handle_recovery_tick)
-                time.sleep(0.05)
+                # Deterministically place the producer in the MIDDLE of
+                # RESUME_AT_TICK's window, then freeze it. The recovery target
+                # iteration is computed as
+                # (write_timestamp - start_ts) // frames_per_tick, so any drift
+                # of the producer between here and when the loop next samples its
+                # timestamp could shift the resume point by a tick. Because the
+                # producer is warmed up (advancing at real-time, not sprinting to
+                # catch up), we busy-spin until it crosses the mid-point of the
+                # target tick and immediately freeze it there, pinning the
+                # computed target to RESUME_AT_TICK regardless of scheduling
+                # jitter. The producer is released again from the recovery
+                # callback once recovery is underway.
+                buffer           = neurons._shared_buffer
+                assert buffer is not None
+                resume_timestamp = first_tick_timestamp + (RESUME_AT_TICK * FRAMES_PER_TICK) + (FRAMES_PER_TICK // 2)
+                while buffer.write_timestamp < resume_timestamp:
+                    pass
+                buffer.pause_flag = True
+                # Confirm the producer has actually halted before the loop reads
+                # its timestamp, so the resume target cannot drift.
+                prev = -1
+                while buffer.write_timestamp != prev:
+                    prev = buffer.write_timestamp
+                    time.sleep(0.002)
             elif (tick.iteration == STOP_AFTER_TICKS - 1):
                 last_tick_timestamp = tick.analysis.start_timestamp
 

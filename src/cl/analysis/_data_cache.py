@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from scipy.sparse import dok_array
+if TYPE_CHECKING:
+    from scipy.sparse import dok_array
 
 from ..util import RecordingView
 from . import Array1DInt, AnalysisMetadata
@@ -19,14 +23,28 @@ class _AnalysisDataCache:
         self.metadata   = AnalysisMetadata(
             file_path          = file_path,
             channel_count      = recording.attributes["channel_count"],
-            sampling_frequency = recording.attributes["sampling_frequency"],
+            sampling_frequency = recording.attributes["frames_per_second"],
             duration_frames    = recording.attributes["duration_frames"],
             duration_seconds   = recording.attributes["duration_seconds"]
+            )
+        self._maximum_recording_timestamp = recording.attributes["duration_frames"]
+        self.set_timestamp_range(
+            minimum_timestamp = 0,
+            maximum_timestamp = self._maximum_recording_timestamp
             )
 
     #
     # Data caches for analysis
     #
+
+    _minimum_timestamp: int
+    """ Minimum timestamp for all data contained within this cache. """
+
+    _maximum_timestamp: int
+    """ Maximum timestamp for all data contained within this cache. """
+
+    _maximum_recording_timestamp: int
+    """ Maximum timestamp contained within the recording. """
 
     _spike_count_bin_size: int
     """ Size of each time bin in frames. """
@@ -58,6 +76,63 @@ class _AnalysisDataCache:
     """
 
     #
+    # Data cache setters
+    #
+
+    def set_timestamp_range(
+        self,
+        minimum_timestamp: int | None = None,
+        maximum_timestamp: int | None = None,
+        ):
+        """
+        Sets the timestamp range for data contained within this cache. If the timestamp
+        range has changed, cached data will be reset.
+
+        Args:
+            minimum_timestamp: Limit to data above this timestamp.
+            maximum_timestamp: Limit to data below thist timestamp.
+        """
+        old_minimum_timestamp = getattr(self, "_minimum_timestamp", 0)
+        old_maximum_timestamp = getattr(self, "_maximum_timestamp", self._maximum_recording_timestamp)
+
+        if minimum_timestamp is None:
+            # Providing None means reset to default values
+            self._minimum_timestamp = 0
+        else:
+            if minimum_timestamp < 0:
+                raise ValueError("Minimum timestamp cannot be lower than 0")
+            self._minimum_timestamp = minimum_timestamp
+
+        if maximum_timestamp is None:
+            # Providing None means reset to default values
+            self._maximum_timestamp = self._maximum_recording_timestamp
+        else:
+            if maximum_timestamp > self._maximum_recording_timestamp:
+                raise ValueError(
+                    f"Maximum timestamp cannot be higher than recording duration of"
+                    f"{self._maximum_recording_timestamp} frames"
+                    )
+            self._maximum_timestamp = maximum_timestamp
+
+        if self._minimum_timestamp > self._maximum_timestamp:
+            # Strictly enforce min <= max, else abort and revert to old values
+            self._minimum_timestamp = old_minimum_timestamp
+            self._maximum_timestamp = old_maximum_timestamp
+            raise ValueError("Minimum timestamp cannot be greater than maximum timestamp")
+
+        # Reset cache if specified timestamp range has changed
+        if not (
+            self._minimum_timestamp == old_minimum_timestamp and
+            self._maximum_timestamp == old_maximum_timestamp
+            ):
+            if hasattr(self, "_spike_count_per_time_bin"):
+                del self._spike_count_per_time_bin
+            if hasattr(self, "_spike_train"):
+                del self._spike_train
+            if hasattr(self, "_stim_train"):
+                del self._stim_train
+
+    #
     # Data cache getters
     #
 
@@ -80,6 +155,7 @@ class _AnalysisDataCache:
         Returns:
             dok_array[int]: sparse (dictionary of keys) array with shape (channel_count, bin_count).
         """
+        from scipy.sparse import dok_array
         if (
             hasattr(self, "_spike_count_bin_size") and
             hasattr(self, "_spike_count_per_time_bin") and
@@ -95,19 +171,21 @@ class _AnalysisDataCache:
         assert self._recording.spikes is not None, "Recording does not contain spikes."
 
         channel_count      = self._recording.attributes["channel_count"]
-        sampling_frequency = self._recording.attributes["sampling_frequency"]
-
-        duration_seconds   = self._recording.attributes["duration_seconds"]
-        duration_frames    = duration_seconds * sampling_frequency
+        minimum_timestamp  = self._minimum_timestamp
+        maximum_timestamp  = self._maximum_timestamp
         if limit_to_max_spike_timestamp:
-            duration_frames = self._recording.spikes[-1]["timestamp"]
+            max_spike_timestamp = self._recording.spikes[-1]["timestamp"]
+            maximum_timestamp   = min(maximum_timestamp, max_spike_timestamp)
+        duration_frames    = maximum_timestamp - minimum_timestamp
         bin_count          = math.ceil(duration_frames / bin_size)
         spike_count_array  = dok_array((channel_count, bin_count), dtype=int)
 
         for spike in self._recording.spikes:
-            channel  = spike["channel"]
-            time_bin = spike["timestamp"] // bin_size
-            spike_count_array[channel, time_bin] += 1
+            channel   = spike["channel"]
+            timestamp = spike["timestamp"]
+            if minimum_timestamp <= timestamp < maximum_timestamp:
+                time_bin = (spike["timestamp"] - minimum_timestamp) // bin_size
+                spike_count_array[channel, time_bin] += 1
 
         channel_mask      = np.array([ ch for ch in range(channel_count) if not ch in excluded_channels ])
         spike_count_array = spike_count_array[channel_mask, :]
@@ -126,6 +204,7 @@ class _AnalysisDataCache:
         Returns:
             dok_array[bool]: sparse (dictionary of keys) array with shape (channel_count, duration_frames).
         """
+        from scipy.sparse import dok_array
         if (
             hasattr(self, "_spike_train") and
             isinstance(self._spike_train, dok_array)
@@ -133,7 +212,9 @@ class _AnalysisDataCache:
             return self._spike_train
 
         channel_count     = self._recording.attributes["channel_count"]
-        duration_frames   = self._recording.attributes["duration_frames"]
+        minimum_timestamp = self._minimum_timestamp
+        maximum_timestamp = self._maximum_timestamp
+        duration_frames   = maximum_timestamp - minimum_timestamp
         spike_train_array = dok_array((channel_count, duration_frames), dtype=bool)
 
         assert self._recording.spikes is not None, "Recording does not contain spikes."
@@ -141,7 +222,9 @@ class _AnalysisDataCache:
         for spike in self._recording.spikes:
             channel   = spike["channel"]
             timestamp = spike["timestamp"]
-            spike_train_array[channel, timestamp] = 1
+            if minimum_timestamp <= timestamp < maximum_timestamp:
+                ts_index = timestamp - self._minimum_timestamp
+                spike_train_array[channel, ts_index] = 1
 
         self._spike_train = spike_train_array
         return spike_train_array
@@ -171,6 +254,7 @@ class _AnalysisDataCache:
         Returns:
             dok_array[bool]: sparse (dictionary of keys) array with shape (channel_count, duration_frames).
         """
+        from scipy.sparse import dok_array
         if (
             hasattr(self, "_stim_train") and
             isinstance(self._stim_train, dok_array)
@@ -178,7 +262,9 @@ class _AnalysisDataCache:
             return self._stim_train
 
         channel_count     = self._recording.attributes["channel_count"]
-        duration_frames   = self._recording.attributes["duration_frames"]
+        minimum_timestamp = self._minimum_timestamp
+        maximum_timestamp = self._maximum_timestamp
+        duration_frames   = maximum_timestamp - minimum_timestamp
         stim_train_array  = dok_array((channel_count, duration_frames), dtype=bool)
 
         assert self._recording.stims is not None, "Recording does not contain stims."
@@ -186,7 +272,9 @@ class _AnalysisDataCache:
         for stim in self._recording.stims:
             channel   = stim["channel"]
             timestamp = stim["timestamp"]
-            stim_train_array[channel, timestamp] = 1
+            if minimum_timestamp <= timestamp < maximum_timestamp:
+                ts_index = timestamp - self._minimum_timestamp
+                stim_train_array[channel, ts_index] = 1
 
         self._stim_train = stim_train_array
         return stim_train_array

@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
+_TIMESTAMP_KEY = operator.attrgetter("timestamp")
+
 @dataclass(slots=True)
 class StimEntry[T]:
     """A stim entry with timestamp and payload."""
@@ -63,16 +65,57 @@ class ChannelStimQueue[T]:
             bisect.insort(self._channel_stims[channel], entry)
         self._total_count += 1
 
+    def put_sorted(self, timestamp: int, channel: int, payload: T) -> None:
+        """
+        Append a stim entry that is known to have timestamp >= all existing
+        entries on this channel.
+
+        The caller **must** guarantee monotonic insertion order per channel;
+        no sorting is performed.  This is O(1) amortised instead of O(log k)
+        for `bisect.insort`.
+        """
+        entry = StimEntry(timestamp, payload)
+        if channel not in self._channel_stims:
+            self._channel_stims[channel] = [entry]
+        else:
+            self._channel_stims[channel].append(entry)
+        self._total_count += 1
+
+    def put_many_sorted(self, channel: int, items: Iterable[tuple[int, T]]) -> None:
+        """
+        Append stim entries that are already sorted for the given channel.
+
+        If the batch starts before the current tail, merge it and restore order.
+        """
+        entries = [StimEntry(timestamp, payload) for timestamp, payload in items]
+        if not entries:
+            return
+
+        if channel not in self._channel_stims:
+            self._channel_stims[channel] = entries
+        else:
+            stim_list = self._channel_stims[channel]
+            if stim_list and entries[0].timestamp < stim_list[-1].timestamp:
+                stim_list.extend(entries)
+                stim_list.sort(key=operator.attrgetter("timestamp"))
+            else:
+                stim_list.extend(entries)
+
+        self._total_count += len(entries)
+
     def interrupt_channels(
         self,
         channels      : Iterable[int],
         from_timestamp: int,
+        *,
+        return_removed: bool = True,
     ) -> list[tuple[int, int, T]]:
         """
         Remove and return stims on the specified channels at or after from_timestamp.
 
         Stims before from_timestamp are kept. Returns list of (timestamp, channel, payload)
-        for removed stims.
+        for removed stims unless return_removed=False, in which case removals are not
+        materialized.
 
         Time complexity: O(c * log k) where c = number of channels, k = stims per channel.
         """
@@ -87,15 +130,16 @@ class ChannelStimQueue[T]:
                 continue
 
             # Binary search for first stim >= from_timestamp
-            cutoff_idx = bisect.bisect_left(stim_list, StimEntry(from_timestamp, None))
+            cutoff_idx = bisect.bisect_left(stim_list, from_timestamp, key=_TIMESTAMP_KEY)
 
             # Stims at and after cutoff are removed
             if cutoff_idx < len(stim_list):
-                for entry in stim_list[cutoff_idx:]:
-                    removed.append((entry.timestamp, channel, entry.payload))
-                    self._total_count -= 1
+                if return_removed:
+                    for entry in stim_list[cutoff_idx:]:
+                        removed.append((entry.timestamp, channel, entry.payload))
+                self._total_count -= len(stim_list) - cutoff_idx
                 # Keep only stims before the cutoff
-                self._channel_stims[channel] = stim_list[:cutoff_idx]
+                del stim_list[cutoff_idx:]
 
         return removed
 
@@ -112,7 +156,7 @@ class ChannelStimQueue[T]:
                 continue
 
             # Binary search for first stim >= to_timestamp
-            cutoff_idx = bisect.bisect_left(stim_list, StimEntry(to_timestamp, None))
+            cutoff_idx = bisect.bisect_left(stim_list, to_timestamp, key=_TIMESTAMP_KEY)
 
             if cutoff_idx > 0:
                 # Pop stims before cutoff
@@ -140,6 +184,23 @@ class ChannelStimQueue[T]:
                     min_ts = ts
         return min_ts
 
+    def peek_min_timestamp_from(self, from_timestamp: int) -> int | None:
+        """
+        Return the minimum timestamp >= from_timestamp across all channels.
+
+        Time complexity: O(c * log k) where c = channels, k = stims per channel.
+        """
+        min_ts: int | None = None
+        for stim_list in self._channel_stims.values():
+            if not stim_list:
+                continue
+            idx = bisect.bisect_left(stim_list, from_timestamp, key=_TIMESTAMP_KEY)
+            if idx < len(stim_list):
+                ts = stim_list[idx].timestamp
+                if min_ts is None or ts < min_ts:
+                    min_ts = ts
+        return min_ts
+
     def get_stims_before(self, to_timestamp: int) -> list[tuple[int, int, T]]:
         """
         Return (but don't remove) all stims with timestamp < to_timestamp.
@@ -152,8 +213,70 @@ class ChannelStimQueue[T]:
             if not stim_list:
                 continue
 
-            cutoff_idx = bisect.bisect_left(stim_list, StimEntry(to_timestamp, None))
+            cutoff_idx = bisect.bisect_left(stim_list, to_timestamp, key=_TIMESTAMP_KEY)
             result.extend((entry.timestamp, channel, entry.payload) for entry in stim_list[:cutoff_idx])
+
+        result.sort(key=operator.itemgetter(0))
+        return result
+
+    def get_stims_in_range(self, from_timestamp: int, to_timestamp: int) -> list[tuple[int, int, T]]:
+        """
+        Return (but don't remove) all stims with from_timestamp <= timestamp < to_timestamp.
+
+        Time complexity: O(m) where m = number of matching stims.
+        """
+        result: list[tuple[int, int, T]] = []
+
+        for channel, stim_list in self._channel_stims.items():
+            if not stim_list:
+                continue
+
+            lo = bisect.bisect_left(stim_list, from_timestamp, key=_TIMESTAMP_KEY)
+            hi = bisect.bisect_left(stim_list, to_timestamp, key=_TIMESTAMP_KEY)
+            result.extend((entry.timestamp, channel, entry.payload) for entry in stim_list[lo:hi])
+
+        result.sort(key=operator.itemgetter(0))
+        return result
+
+    def prune_and_get_range(
+        self,
+        prune_before  : int,
+        from_timestamp: int,
+        to_timestamp  : int,
+    ) -> list[tuple[int, int, T]]:
+        """
+        Remove stims with timestamp < prune_before, then return (without removing)
+        stims with from_timestamp <= timestamp < to_timestamp — in a single pass.
+
+        This is equivalent to calling pop_until(prune_before) followed by
+        get_stims_in_range(from_timestamp, to_timestamp), but iterates the
+        channel dict only once instead of twice.
+
+        Assumes prune_before <= from_timestamp (which holds when pruning by the
+        ring-buffer retention window and reading within that window).
+
+        Time complexity: O(c * log k + m log m) where c = channels, k = stims
+        per channel, m = matching stims in range.
+        """
+        result: list[tuple[int, int, T]] = []
+
+        for channel, stim_list in self._channel_stims.items():
+            if not stim_list:
+                continue
+
+            # Prune entries before the retention window
+            prune_idx = bisect.bisect_left(stim_list, prune_before, key=_TIMESTAMP_KEY)
+            if prune_idx:
+                del stim_list[:prune_idx]
+                self._total_count -= prune_idx
+
+            if not stim_list:
+                continue
+
+            # Collect entries in [from_timestamp, to_timestamp)
+            lo = bisect.bisect_left(stim_list, from_timestamp, key=_TIMESTAMP_KEY)
+            hi = bisect.bisect_left(stim_list, to_timestamp, lo, key=_TIMESTAMP_KEY)
+            result.extend((entry.timestamp, channel, entry.payload) for entry in stim_list[lo:hi])
 
         result.sort(key=operator.itemgetter(0))
         return result
@@ -166,8 +289,8 @@ class ChannelStimQueue[T]:
 
     def get_last_timestamp_for_channel(self, channel: int) -> int | None:
         """Get the last (maximum) timestamp for a specific channel."""
-        if self._channel_stims.get(channel):
-            return self._channel_stims[channel][-1].timestamp
+        if (entry := self._channel_stims.get(channel)) and (len(entry) > 0) and (last_entry := entry[-1]):
+            return last_entry.timestamp
         return None
 
     def get_last_entry_before(self, channel: int, before_timestamp: int) -> tuple[int, T] | None:
@@ -177,7 +300,7 @@ class ChannelStimQueue[T]:
 
         stim_list = self._channel_stims[channel]
         # Binary search for first stim >= before_timestamp
-        cutoff_idx = bisect.bisect_left(stim_list, StimEntry(before_timestamp, None))
+        cutoff_idx = bisect.bisect_left(stim_list, before_timestamp, key=_TIMESTAMP_KEY)
 
         # If there are stims before the cutoff, return the last one
         if cutoff_idx > 0:
@@ -196,6 +319,31 @@ class ChannelStimQueue[T]:
                 self._channel_stims[channel] = []
             return count
         return 0
+
+    def clear(self) -> None:
+        """Clear all stims from all channels, and return to empty state."""
+        self._channel_stims.clear()
+        self._total_count = 0
+
+    def clear_from_per_channel(self, channel_cutoffs: dict[int, int]) -> None:
+        """
+        Remove stims at or after each channel's cutoff timestamp.
+
+        This is used by incremental rebuild to clear only post-checkpoint stims
+        while preserving pre-checkpoint stims. More efficient than clearing
+        all channels when only a subset need trimming.
+
+        Time complexity: O(c * log k) where c = channels with cutoffs,
+        k = stims per channel.
+        """
+        for channel, cutoff in channel_cutoffs.items():
+            stim_list = self._channel_stims.get(channel)
+            if not stim_list:
+                continue
+            cutoff_idx = bisect.bisect_left(stim_list, cutoff, key=_TIMESTAMP_KEY)
+            if cutoff_idx < len(stim_list):
+                self._total_count -= len(stim_list) - cutoff_idx
+                del stim_list[cutoff_idx:]
 
     def qsize(self) -> int:
         """Return total number of stims across all channels."""

@@ -7,7 +7,6 @@ from collections import defaultdict
 from math import isfinite
 
 import numpy as np
-import scipy
 
 from ...util import RecordingView
 from .. import AnalysisResultCriticality, Array1DInt, Array1DFloat
@@ -134,64 +133,74 @@ def _analyse_criticality(
         beta_exponent_std = float(np.std(bootstrapped_beta_exponents))
 
     # Power-law analysis on avalanche_spike_counts (sizes)
-    max_spike_count_threshold = avalanche_spike_counts.max() ** 0.8
-    filtered_spike_counts     = avalanche_spike_counts[avalanche_spike_counts < max_spike_count_threshold]
     min_spike_count_bound     = min_spike_count_threshold
-    max_spike_count_bound     = max_spike_count_threshold
+    max_spike_count_bound     = float("nan")
     tau_exponent_spike_counts = float("nan")
+    ks_min_bound_spike_counts = float("nan")
     ks_stat_spike_counts      = float("inf")
 
-    try:
-        exclusion_bounds = _find_exclusion_bounds(
-            data            = filtered_spike_counts,
-            power_law_limit = min_spike_count_threshold
-            )
-        min_spike_count_bound = exclusion_bounds["min_bound"]
-        max_spike_count_bound = exclusion_bounds["max_bound"]
-        ks_stat_spike_counts  = exclusion_bounds["ks_statistic"]
-    except ValueError:
-        ...
+    if avalanche_spike_counts.size > 0:
+        max_spike_count_threshold = avalanche_spike_counts.max() ** 0.8
+        filtered_spike_counts     = avalanche_spike_counts[avalanche_spike_counts < max_spike_count_threshold]
+        max_spike_count_bound     = max_spike_count_threshold
 
-    candidate_spike_count_indices = np.where(
-        (avalanche_spike_counts >= min_spike_count_bound) &
-        (avalanche_spike_counts <= max_spike_count_bound)
-        )[0]
-    spike_counts_power_laws = _fit_power_law(
-        data  = avalanche_spike_counts[candidate_spike_count_indices],
-        limit = min_spike_count_bound
-        )
-    tau_exponent_spike_counts = spike_counts_power_laws["power_law_exponent"]
-    ks_min_bound_spike_counts = spike_counts_power_laws["min_bound"]
+        try:
+            exclusion_bounds = _find_exclusion_bounds(
+                data            = filtered_spike_counts,
+                power_law_limit = min_spike_count_threshold
+                )
+            min_spike_count_bound = exclusion_bounds["min_bound"]
+            max_spike_count_bound = exclusion_bounds["max_bound"]
+            ks_stat_spike_counts  = exclusion_bounds["ks_statistic"]
+        except ValueError:
+            ...
+
+        candidate_spike_counts = avalanche_spike_counts[
+            (avalanche_spike_counts >= min_spike_count_bound) &
+            (avalanche_spike_counts <= max_spike_count_bound)
+            ]
+        if candidate_spike_counts.size > 0:
+            spike_counts_power_laws = _fit_power_law(
+                data  = candidate_spike_counts,
+                limit = min_spike_count_bound
+                )
+            tau_exponent_spike_counts = spike_counts_power_laws["power_law_exponent"]
+            ks_min_bound_spike_counts = spike_counts_power_laws["min_bound"]
 
     # Power-law analysis on avalanche_durations
-    max_duration_threshold   = avalanche_durations.max() ** 0.8
-    filtered_durations       = avalanche_durations[avalanche_durations < max_duration_threshold]
     min_durations_bound      = min_duration
-    max_durations_bound      = max_duration_threshold
+    max_durations_bound      = float("nan")
     alpha_exponent_durations = float("nan")
+    ks_min_bound_durations   = float("nan")
     ks_stat_duration         = float("inf")
 
-    try:
-        exclusion_bounds = _find_exclusion_bounds(
-            data            = filtered_durations,
-            power_law_limit = min_durations_bound
-            )
-        min_durations_bound = exclusion_bounds["min_bound"]
-        max_durations_bound = exclusion_bounds["max_bound"]
-        ks_stat_duration    = exclusion_bounds["ks_statistic"]
-    except ValueError:
-        ...
+    if avalanche_durations.size > 0:
+        max_duration_threshold = avalanche_durations.max() ** 0.8
+        filtered_durations     = avalanche_durations[avalanche_durations < max_duration_threshold]
+        max_durations_bound    = max_duration_threshold
 
-    candidate_durations_indices = np.where(
-        (avalanche_durations >= min_durations_bound) &
-        (avalanche_durations <= max_durations_bound)
-        )[0]
-    durations_power_laws = _fit_power_law(
-        data  = avalanche_durations[candidate_durations_indices],
-        limit = min_durations_bound
-        )
-    alpha_exponent_durations = durations_power_laws["power_law_exponent"]
-    ks_min_bound_durations   = durations_power_laws["min_bound"]
+        try:
+            exclusion_bounds = _find_exclusion_bounds(
+                data            = filtered_durations,
+                power_law_limit = min_durations_bound
+                )
+            min_durations_bound = exclusion_bounds["min_bound"]
+            max_durations_bound = exclusion_bounds["max_bound"]
+            ks_stat_duration    = exclusion_bounds["ks_statistic"]
+        except ValueError:
+            ...
+
+        candidate_durations = avalanche_durations[
+            (avalanche_durations >= min_durations_bound) &
+            (avalanche_durations <= max_durations_bound)
+            ]
+        if candidate_durations.size > 0:
+            durations_power_laws = _fit_power_law(
+                data  = candidate_durations,
+                limit = min_durations_bound
+                )
+            alpha_exponent_durations = durations_power_laws["power_law_exponent"]
+            ks_min_bound_durations   = durations_power_laws["min_bound"]
 
     # Scaling relation
     scaling_relation_exponent_predicted    = float("nan")
@@ -200,14 +209,21 @@ def _analyse_criticality(
     avalanche_shape_collapse_error         = float("nan")
     time_values                            = np.array([])
     scaling_relation_fit_params            = np.array([])
-    if isfinite(tau_exponent_spike_counts) & isfinite(alpha_exponent_durations):
+    if (
+        avalanche_durations.size > 0
+        and isfinite(tau_exponent_spike_counts)
+        and isfinite(alpha_exponent_durations)
+        and tau_exponent_spike_counts != 1
+    ):
         time_values = np.arange(1, np.max(avalanche_durations) + 1)
         valid_times = (time_values > min_durations_bound) & (time_values < min_durations_bound + 60)
         time_values = time_values[valid_times]
-        average_spike_counts = np.array([
-            np.mean(avalanche_spike_counts[avalanche_durations == t])
-            for t in time_values
-            ])
+        average_spike_counts = np.full(len(time_values), fill_value=np.nan)
+        for i, t in enumerate(time_values):
+            spikes_at_t = avalanche_spike_counts[avalanche_durations == t]
+            # Not every integer duration in time_values has a matching avalanche
+            if spikes_at_t.size > 0:
+                average_spike_counts[i] = spikes_at_t.mean()
         valid_average_spike_counts = ~np.isnan(average_spike_counts)
         time_values                = time_values[valid_average_spike_counts]
         average_spike_counts       = average_spike_counts[valid_average_spike_counts]
@@ -307,6 +323,12 @@ def _calc_beta_exponent(
     Returns:
         _ResultBetaExponent
     """
+    if len(profiles) == 0 or len(durations) == 0:
+        return _ResultBetaExponent(
+            beta_candidate             = float("nan"),
+            beta_candidates_over_range = np.full(beta_range.shape, fill_value=np.nan, dtype=float)
+            )
+
     variances = []
     for profile, duration in zip(profiles, durations):
         t = (np.arange(1, duration + 1)) / duration
@@ -315,10 +337,17 @@ def _calc_beta_exponent(
         variances.append(variance)
     variances = np.array(variances)
 
-    log_durations              = np.log(durations)
-    log_variances              = np.log(variances)
+    valid_indices = (durations > 0) & (variances > 0) & np.isfinite(variances)
+    if not np.any(valid_indices):
+        return _ResultBetaExponent(
+            beta_candidate             = float("nan"),
+            beta_candidates_over_range = np.full(beta_range.shape, fill_value=np.nan, dtype=float)
+            )
+
+    log_durations              = np.log(durations[valid_indices])
+    log_variances              = np.log(variances[valid_indices])
     min_beta_error             = np.inf
-    beta_candidate             = 0
+    beta_candidate             = float("nan")
     beta_candidates_over_range = []
     for beta in beta_range:
         y          = log_variances + 2 * beta * log_durations
@@ -348,6 +377,15 @@ class _ResultPowerLaw(TypedDict):
     log_likelihood: float
     """ Log-likelihood value for the best fit. """
 
+def _empty_power_law_result(limit: int) -> _ResultPowerLaw:
+    """Return a sentinel result when there is not enough data to fit."""
+    return _ResultPowerLaw(
+        power_law_exponent = float("nan"),
+        min_bound          = max(1, int(limit)),
+        ks_statistic       = float("inf"),
+        log_likelihood     = float("nan")
+        )
+
 def _fit_power_law(
     data:  Array1DInt | Array1DFloat,
     limit: int
@@ -372,50 +410,83 @@ def _fit_power_law(
     Returns:
         _ResultPowerLaw
     """
+    import scipy
+
+    data = data[np.isfinite(data)]
+    data = data[data > 0]
+    if data.size == 0 or limit < 1:
+        return _empty_power_law_result(limit)
+
+    xmax = int(np.max(data))
+    xmax_bound = min(max(1, int(limit)), xmax)
+    if xmax_bound < 1:
+        return _empty_power_law_result(limit)
+
     ks_stats        = []  # KS statistics for each x0
     p_exponents     = []  # p_exponent values for each x0
     log_likelihoods = []  # log-likelihood values for each x0
+    x0_values       = []  # x0 values that had enough data to fit
 
     # Loop over potential minimum values (x0) for the power-law fit
-    for x0 in np.arange(1, limit + 1):
-
-        # Filter data based on current x0
+    for x0 in range(1, xmax_bound + 1):
         filtered_data = data[data >= x0]
-        xmax          = np.max(data)
-        indices       = np.where((x0 <= filtered_data) & (filtered_data <= xmax))[0]
-        n             = np.size(indices)
-        unique_values = np.unique(filtered_data[indices])
+        n             = np.size(filtered_data)
+        unique_values = np.unique(filtered_data)
+        if n == 0 or unique_values.size == 0:
+            continue
 
-        # Define the log-likelihood function for power-law fitting
-        log_likelihood_func = lambda p_exponent: (
-            p_exponent * np.sum(np.log(filtered_data[indices]))
-            - n * np.log(1 / np.sum(np.power(unique_values, -p_exponent)))
-            )
+        log_filtered_sum = float(np.sum(np.log(filtered_data)))
+
+        def log_likelihood_func(p_exponent):
+            p_value = float(np.asarray(p_exponent).reshape(-1)[0])
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                denominator = np.sum(np.power(unique_values, -p_value))
+            if denominator <= 0 or not np.isfinite(denominator):
+                return np.inf
+            return p_value * log_filtered_sum + n * np.log(denominator)
 
         # Optimize the log-likelihood to find the best p_exponent
-        p_exponent_estimate  = scipy.optimize.fmin(func=log_likelihood_func, x0=2.3, disp=False)  # Start search from 2.3, returns array shape (1,)
-        log_likelihood_value = -log_likelihood_func(p_exponent_estimate)                          # Value of the log-likelihood at the minimum
-        log_likelihoods.append(log_likelihood_value)
+        p_exponent_estimate = scipy.optimize.fmin(func=log_likelihood_func, x0=2.3, disp=False)  # Start search from 2.3, returns array shape (1,)
+        p_exponent_value    = float(p_exponent_estimate[0])
+        log_likelihood_value = -log_likelihood_func(p_exponent_value)                           # Value of the log-likelihood at the minimum
+        if not np.isfinite(log_likelihood_value):
+            continue
 
         # Compute the cumulative distribution function (CDF) of the burst data
-        data_cdf        = np.cumsum(np.histogram(filtered_data, bins=np.arange(x0, xmax + 2))[0] / n)
-        scaling_factor  = 1 / np.sum(np.power(unique_values, -p_exponent_estimate))
-        theoretical_cdf = np.cumsum(scaling_factor * np.power(np.arange(x0, xmax + 1), -p_exponent_estimate))
+        bins    = np.arange(x0, xmax + 2)
+        support = np.arange(x0, xmax + 1)
+        if bins.size < 2 or support.size == 0:
+            continue
+        data_cdf = np.cumsum(np.histogram(filtered_data, bins=bins)[0] / n)
+
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            denominator = np.sum(np.power(unique_values, -p_exponent_value))
+            if denominator <= 0 or not np.isfinite(denominator):
+                continue
+            scaling_factor  = 1 / denominator
+            theoretical_cdf = np.cumsum(scaling_factor * np.power(support, -p_exponent_value))
+
+        if data_cdf.size == 0 or theoretical_cdf.size != data_cdf.size:
+            continue
 
         # Compute the Kolmogorov-Smirnov statistic for the fit
-        ks_stat_current = np.max(np.abs(data_cdf - theoretical_cdf))
+        ks_stat_current = float(np.max(np.abs(data_cdf - theoretical_cdf)))
+        if not np.isfinite(ks_stat_current):
+            continue
         ks_stats.append(ks_stat_current)
+        p_exponents.append(p_exponent_value)
+        log_likelihoods.append(float(log_likelihood_value))
+        x0_values.append(x0)
 
-        # Store the p_exponent value
-        p_exponents.append(float(p_exponent_estimate[0]))
+    if not ks_stats:
+        return _empty_power_law_result(limit)
 
     # Find the x0 that minimizes the KS statistic
-    best_x0_indices = np.where(ks_stats == np.min(ks_stats))[0]
-    best_x0_index   = int(best_x0_indices[0])
-    p_exponent      = p_exponents[best_x0_index]
-    log_likelihood  = log_likelihoods[best_x0_index]
-    ks_stat         = float(np.min(ks_stats))
-    xmin            = best_x0_index + 1 # Adjust index to account for range starting from 1
+    best_x0_index  = int(np.argmin(ks_stats))
+    p_exponent     = p_exponents[best_x0_index]
+    log_likelihood = log_likelihoods[best_x0_index]
+    ks_stat        = float(ks_stats[best_x0_index])
+    xmin           = x0_values[best_x0_index]
 
     return _ResultPowerLaw(
         power_law_exponent = p_exponent,
@@ -458,40 +529,68 @@ def _find_exclusion_bounds(
     Returns:
         _ResultKSExclusionBounds
     """
+    data = data[np.isfinite(data)]
+    data = data[data > 0]
+    if data.size == 0:
+        raise ValueError("Insufficient data to determine power-law exclusion bounds.")
+
     # Initialize variables for the KS test
     ks_stat                          = 1
     ks_delta                         = 1
     min_bound                        = 1
     max_bound                        = float(np.max(data))
-    ks_threshold                     = np.min([1 / np.sqrt(np.size(data[data > min_bound])), 0.1])
+    count_above_min_bound            = np.size(data[data > min_bound])
+    if count_above_min_bound == 0:
+        raise ValueError("Insufficient data above minimum bound.")
+    ks_threshold                     = min(1 / np.sqrt(count_above_min_bound), 0.1)
     power_law_exponent: float | None = None
 
     while ks_stat > ks_threshold and ks_delta > 0.0005:
         # Fit power-law distribution to the data
         power_law_result = _fit_power_law(
-            data        = data,
+            data  = data,
             limit = power_law_limit
             )
         power_law_exponent = power_law_result["power_law_exponent"]
-        min_bound          = power_law_result["min_bound"]
+        if not isfinite(power_law_exponent):
+            raise ValueError("Insufficient data to determine power-law exponent.")
+        min_bound = power_law_result["min_bound"]
 
         # Calculate the cumulative distribution function (CDF) of the data
+        max_bound_int = int(max_bound)
         filtered_data = data[data >= min_bound]
         filtered_size = np.size(filtered_data)
-        empirical_cdf = np.cumsum(np.histogram(filtered_data, bins=np.arange(min_bound, max_bound + 2))[0] / filtered_size)
+        if filtered_size == 0:
+            raise ValueError("Insufficient data within exclusion bounds.")
+        empirical_cdf = np.cumsum(np.histogram(filtered_data, bins=np.arange(min_bound, max_bound_int + 2))[0] / filtered_size)
 
         # Calculate the perfect power-law CDF for comparison
-        unique_bursts   = np.unique(data[(min_bound <= data) & (data <= max_bound)])
-        scaling_factor  = 1 / np.sum(np.power(unique_bursts, -power_law_exponent))
-        theoretical_cdf = np.cumsum(scaling_factor * np.power(np.arange(min_bound, max_bound + 1), -power_law_exponent))
+        unique_bursts = np.unique(data[(min_bound <= data) & (data <= max_bound)])
+        support       = np.arange(min_bound, max_bound_int + 1)
+        if unique_bursts.size == 0 or support.size == 0:
+            raise ValueError("Insufficient data within exclusion bounds.")
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            denominator = np.sum(np.power(unique_bursts, -power_law_exponent))
+            if denominator <= 0 or not np.isfinite(denominator):
+                raise ValueError("Invalid power-law normalization.")
+            scaling_factor  = 1 / denominator
+            theoretical_cdf = np.cumsum(scaling_factor * np.power(support, -power_law_exponent))
+
+        if empirical_cdf.size == 0 or theoretical_cdf.size != empirical_cdf.size:
+            raise ValueError("Insufficient data within exclusion bounds.")
 
         # Compute KS statistic and its change
         previous_ks_stat = ks_stat
         ks_stat          = float(np.max(np.abs(empirical_cdf - theoretical_cdf)))
+        if not isfinite(ks_stat):
+            raise ValueError("Invalid KS statistic.")
         ks_delta         = np.abs(previous_ks_stat - ks_stat)
 
         # Update data by lowering the upper boundary
         data = data[data < max_bound]
+        if data.size == 0:
+            break
+        max_bound = float(np.max(data))
 
     assert power_law_exponent is not None, "Insufficient data to determine power-law exponent."
     return _ResultKSExclusionBounds(
@@ -546,6 +645,8 @@ def _compute_time_lagged_slopes(
     Returns:
         _ResultTimeLaggedSlopes
     """
+    import scipy
+
     time_lags_k              = np.arange(1, max_lag_k)  # Time lag values
     valid_time_lags_k        = []                       # Only store lags that have sufficient data
     slopes                   = []                       # Regression slopes
@@ -633,6 +734,8 @@ def _estimate_branching_ratio(
     Returns:
         _ResultBranchingRatio
     """
+    import scipy
+
     # Calculate time lagged slopes
     slope_results = _compute_time_lagged_slopes(
         activities_over_time = activities_over_time,

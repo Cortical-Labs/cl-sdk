@@ -12,6 +12,7 @@ and named <folder_name>.zip.
 """
 
 import json
+import os
 import re
 import sys
 import zipfile
@@ -352,13 +353,37 @@ def _create_package(target: Path, output_path: Path) -> tuple[int, int]:
     file_count = 0
     total_size = 0
 
+    # Maps each logical directory path to the frozenset of real paths from the
+    # walk root down to that directory (inclusive). A child whose resolved real
+    # path already appears in this set is on a cycle and is pruned. Tracking the
+    # full ancestry chain (not just the immediate parent) is required to catch
+    # sibling cycles such as a/link -> ../b and b/back -> ../a.
+    ancestor_reals: dict[Path, frozenset[Path]] = {target: frozenset({target.resolve()})}
+
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in target.rglob("*"):
-            if file_path.is_file() and not _should_exclude(file_path, target):
-                arcname = f"{folder_name}/{file_path.relative_to(target)}"
-                zf.write(file_path, arcname)
-                file_count += 1
-                total_size += file_path.stat().st_size
+        for root, dirs, files in os.walk(target, followlinks=True):
+            root_path = Path(root)
+            current   = ancestor_reals[root_path]
+            safe      = []
+            for d in dirs:
+                child = root_path / d
+                try:
+                    child_real = child.resolve()
+                except (OSError, RuntimeError):
+                    continue        # unresolvable or pathological symlink: prune
+                if child_real in current:
+                    continue        # cycle: prune
+                ancestor_reals[child] = current | {child_real}
+                safe.append(d)
+            dirs[:] = safe
+
+            for name in files:
+                file_path = root_path / name
+                if file_path.is_file() and not _should_exclude(file_path, target):
+                    arcname = f"{folder_name}/{file_path.relative_to(target)}"
+                    zf.write(file_path, arcname)
+                    file_count += 1
+                    total_size += file_path.stat().st_size
 
     return file_count, total_size
 

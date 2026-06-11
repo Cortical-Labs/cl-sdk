@@ -68,8 +68,8 @@
 
         --attr-header_bg: #1f1f1f;
     }
-    .pdoc .logo {
-        content: url("/images/logo-dark.svg")
+    .pdoc img.logo {
+        filter: invert();
     }
 }
 

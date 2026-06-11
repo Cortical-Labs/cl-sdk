@@ -4,7 +4,7 @@
 
 {% block head %}
     {{ super() }}
-    <script src="/doc-handler.js"></script>
+    <script src="{{ base_url }}/doc-handler.js"></script>
 {% endblock %}
 
 {% set rendered_preamble = preamble | to_html %}
@@ -40,7 +40,7 @@
   {% macro render_modules(tree, prefix="", depth=0) %}
       {% for name, subtree in tree.items() %}
       {% set full_name = (prefix + "." + name) if prefix else name %}
-      {% set url = "/" + "/".join(full_name.split(".")) + ".html" %}
+      {% set url = base_url + "/" + "/".join(full_name.split(".")) + ".html" %}
       <li style="padding-left: {{ depth * 1.5 }}em">
           <a href="{{ url }}">{{ full_name }}</a>
           {% if subtree %}{{ render_modules(subtree, full_name, depth + 1) }}{% endif %}

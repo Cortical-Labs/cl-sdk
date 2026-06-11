@@ -30,6 +30,9 @@ const FLAG_HAS_STIM             = 1 << 1;
 let ws;
 let connectInterval     = initialConnectIntervalMs;
 let scheduledReconnect;
+let connectionAttempt   = 0;
+let isConnecting        = false;
+let listenersRegistered = false;
 
 // Cached WebSocket URL from /_/config endpoint (for mock server support)
 let cachedWsUrl         = null;
@@ -53,10 +56,46 @@ getHideCrosstalk();
 // to produce each analysis result.
 let analysisMs = 0;
 
+// Playback speed multiplier (1.0 = normal, 2.0 = double speed, etc.)
+let playbackSpeed = 1.0;
+
+// Whether the playback is currently paused server-side
+let isPlaybackPaused = false;
+
 export function getAnalysisMsPerResult()
 {
-    return analysisMs;
+    // Scale by playback speed so renderers scroll proportionally faster/slower
+    return playbackSpeed > 0 ? analysisMs / playbackSpeed : analysisMs;
 }
+
+export function getIsPlaybackPaused()
+{
+    return isPlaybackPaused;
+}
+
+export function getUrlSearchParams() {
+    // Get URL parameters, supporting iframe embedding
+    let searchParams;
+    try {
+        searchParams = window.parent?.location.search ?? window.location.search;
+
+        // Merge with own search params to allow overrides
+        const parentParams = new URLSearchParams(searchParams);
+        const ownParams = new URLSearchParams(window.location.search);
+        for (const [key, value] of ownParams.entries()) {
+            parentParams.set(key, value);
+        }
+        searchParams = parentParams.toString() ? `?${parentParams.toString()}` : '';
+    }
+    catch (e) {
+        // Cross-origin iframe, fall back to own location
+        searchParams = window.location.search;
+    }
+    return new URLSearchParams(searchParams);
+}
+
+const urlParams = getUrlSearchParams();
+const isJupyterMode = urlParams.get('jupyterMode') === '1';
 
 export function stimulate(channel)
 {
@@ -79,7 +118,8 @@ export function reset()
 
 export function setVisibleAbsUv(uV)
 {
-    localStorage.setItem('visibleRangeAbsUv', uV);
+    if (!isJupyterMode)
+        localStorage.setItem('visibleRangeAbsUv', uV);
     visibleAbsRaw = uV / uvPerRawAdc;
 }
 
@@ -95,7 +135,8 @@ export function setDcOffsetCorrection(enable)
         return;
 
     isDcOffsetCorrectionEnabled = enable;
-    localStorage.setItem('isDcOffsetCorrectionEnabled', enable ? 'true' : 'false');
+    if (!isJupyterMode)
+        localStorage.setItem('isDcOffsetCorrectionEnabled', enable ? 'true' : 'false');
 }
 
 export function getDcOffsetCorrection()
@@ -152,6 +193,12 @@ export function connect()
         ws.close();
         ws = undefined;
     }
+
+    if (isConnecting)
+        return;
+
+    isConnecting = true;
+    const thisConnectionAttempt = ++connectionAttempt;
 
     function scheduleReconnect()
     {
@@ -226,6 +273,9 @@ export function connect()
 
     getWebSocketUrl().then(wsUrl =>
     {
+        if (!isConnecting || thisConnectionAttempt != connectionAttempt)
+            return;
+
         ws = new WebSocket(wsUrl);
 
         // We want ArrayBuffer objects when receiving binary messages
@@ -235,6 +285,8 @@ export function connect()
             function(event)
             {
                 console.log('Connected to WebSocket server');
+
+                isConnecting = false;
 
                 clearTimeout(scheduledReconnect);
                 scheduledReconnect = undefined;
@@ -278,6 +330,11 @@ export function connect()
                         if (message.analysisMs)
                             analysisMs = message.analysisMs;
 
+                        if (message.playback_speed > 0)
+                            playbackSpeed = message.playback_speed;
+
+                        isPlaybackPaused = !!message.is_paused;
+
                         // Use the long term mean as the DC offset
                         if (message.channel_mean)
                             for (let i = 0; i < channelCount; i++)
@@ -306,6 +363,11 @@ export function connect()
                         // The server periodically updates the rolling channel mean and stddev.
                         //
 
+                        if (message.playback_speed > 0)
+                            playbackSpeed = message.playback_speed;
+
+                        isPlaybackPaused = !!message.is_paused;
+
                         if (message.channel_mean)
                             for (let i = 0; i < channelCount; i++)
                                 channelMean[i] = message.channel_mean[i];
@@ -321,6 +383,7 @@ export function connect()
             function()
             {
                 console.log('WebSocket connection closed');
+                isConnecting = false;
                 disconnect();
 
                 analysis.splice(0, analysis.length);
@@ -334,34 +397,53 @@ export function connect()
             function(error)
             {
                 console.log('WebSocket error');
+                isConnecting = false;
                 disconnect();
 
                 if (document.visibilityState == 'visible')
                     scheduleReconnect();
             };
+    }).catch(error =>
+    {
+        console.log('Failed to connect to WebSocket server:', error);
+        isConnecting = false;
+
+        if (document.visibilityState == 'visible')
+            scheduleReconnect();
     });
 
     // Setup visibility change handling
-    window.addEventListener('visibilitychange', considerVisibility);
-    window.addEventListener('pageshow', considerVisibility);
+    if (!listenersRegistered)
+    {
+        window.addEventListener('visibilitychange', considerVisibility);
+        window.addEventListener('pageshow', considerVisibility);
+        listenersRegistered = true;
+    }
 }
 
 function disconnect(removeListeners = false)
 {
+    connectionAttempt++;
+    isConnecting = false;
+
     if (ws)
     {
         ws.close();
         ws = undefined;
     }
 
-    clearInterval(scheduledReconnect);
+    clearTimeout(scheduledReconnect);
     scheduledReconnect = undefined;
 
     if (!removeListeners)
         return;
 
-    window.removeEventListener('visibilitychange', considerVisibility);
-    window.removeEventListener('pageshow', considerVisibility);
+    if (listenersRegistered)
+    {
+        window.removeEventListener('visibilitychange', considerVisibility);
+        window.removeEventListener('pageshow', considerVisibility);
+        listenersRegistered = false;
+    }
 }
 
 window.addEventListener('beforeunload', () => disconnect(true));
@@ -393,6 +475,10 @@ export function getBufferSize()
 export function getAnalysisToRender(maxEntries)
 {
     if (!maxEntries)
+        return [];
+
+    // When playback is paused server-side, freeze the display without entering buffering mode
+    if (isPlaybackPaused)
         return [];
 
     const analysisToRender = Math.min(maxEntries, analysis.length);

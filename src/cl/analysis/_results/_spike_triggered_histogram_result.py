@@ -1,8 +1,11 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 
-import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
-from matplotlib.gridspec import GridSpec
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 from .. import Array1DInt, Array1DFloat, AnalysisResult
 
@@ -48,6 +51,9 @@ class AnalysisResultSpikeTriggeredHistogram(AnalysisResult):
         Returns:
             list[Axes]: List of Axes drawn with the histogram.
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+
         # Reference results data
         histograms     = self.histograms
         bins           = self.histogram_bins
@@ -78,7 +84,7 @@ class AnalysisResultSpikeTriggeredHistogram(AnalysisResult):
             ax.grid(True)
 
         if title is None:
-            title = f"Spike-triggered Histograms"
+            title = "Spike-triggered Histograms"
         if fig is not None:
             fig.suptitle(title)
 

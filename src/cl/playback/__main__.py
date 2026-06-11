@@ -20,15 +20,29 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-# Enable WebSocket server for visualiser
-os.environ["CL_SDK_WEBSOCKET"] = "1"
+# We'll start the WebSocket server manually with our custom producer
+os.environ["CL_SDK_VISUALISATION"] = "0"
 
-from cl.util import RecordingView, in_vscode
-from cl.visualisation._websocket_subprocess import WebSocketProcessManager
+from ..util import RecordingView, in_vscode
+from .._sim.visualisation._http_server import BASE_HOST, BASE_WS_PORT
+from .._sim.visualisation._websocket_subprocess import WebSocketProcessManager
 
-from ._cli_controller import PlaybackController
-from ._playback_producer import PlaybackProducer
+from .._sim.playback._cli_controller import PlaybackController
+from .._sim.playback._playback_producer import PlaybackProducer
+
+EPILOG = """
+Controls:
+  SPACE                                   Toggle pause/play
+  Left/Right                              Skip ±5 seconds
+  Shift (Ctrl on Windows) + Left/Right    Skip ±1 minute
+  Up/Down                                 Speed up / slow down (±0.25x)
+  g                                       Go to specific timestamp
+  r                                       Restart
+  h / ?                                   Show help
+  q                                       Quit
+"""
 
 _logger = logging.getLogger("cl.playback")
 
@@ -40,6 +54,7 @@ class RecordingMetadata:
     duration_frames        : int
     start_timestamp        : int
     data_stream_attributes : dict[str, dict]
+    app_info               : dict[str, Any] | None
 
 def _setup_visualiser_html(
     app_id  : str,
@@ -62,8 +77,6 @@ def _setup_visualiser_html(
     if in_vscode() and "SSH_CONNECTION" in os.environ:
         ssh_connection = os.environ["SSH_CONNECTION"]
         ssh_ip = ssh_connection.split(" ")[2]
-
-    ws_port = os.environ.get("CL_SDK_WEBSOCKET_PORT", "1025")
 
     css_block = f"<style>{css_str}</style>" if css_str else ""
 
@@ -92,7 +105,6 @@ def _setup_visualiser_html(
 <script>
     const uniqueId = "visualiser";
     const sshIp    = {json.dumps(ssh_ip)};
-    const websocketPort = {ws_port};
 </script>
 <script src="/visualiser/engine.mjs"></script>
 
@@ -100,8 +112,111 @@ def _setup_visualiser_html(
 """
     return html_content
 
-def _load_app_visualiser(app_path: Path | None) -> str | None:
-    """Load the app visualiser HTML from a directory or zip file.
+def _check_app_info(metadata_app_info: dict[str, Any], loaded_app_info: dict[str, Any]) -> None:
+    """Checks that the version of the app in the recording metadata matches the version in the visualiser files."""
+
+    if "version" not in metadata_app_info:
+        _logger.warning("No version found in recording metadata app_info")
+        return
+
+    if "version" not in loaded_app_info:
+        _logger.warning("No version found in visualiser app_info")
+        return
+
+    metadata_version = metadata_app_info["version"]
+    loaded_version   = loaded_app_info["version"]
+    if metadata_version != loaded_version:
+        _logger.warning(
+            "App version mismatch: recording metadata has version '%s' but visualiser files have version '%s'. The application visualiser may be incompatible with this recording.",
+            metadata_version, loaded_version
+        )
+
+def _load_web_files_from_zip(app_info: dict[str, Any] | None, zip_path: Path) -> tuple[str, str, str, str | None]:
+    """Load visualiser files from a zip file."""
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        # Find the top-level directory in the zip
+        names = zf.namelist()
+        top_dirs = set()
+        for name in names:
+            parts = name.split('/')
+            if parts[0]:  # Skip empty parts
+                top_dirs.add(parts[0])
+
+        if len(top_dirs) != 1:
+            _logger.error("Zip file must contain exactly one top-level directory, found: %s", top_dirs)
+            raise RuntimeError(f"Zip file must contain exactly one top-level directory, found: {top_dirs}")
+
+        app_id     = next(iter(top_dirs))
+        web_prefix = f"{app_id}/web/"
+
+        # Check for required visualiser files
+        html_path = f"{web_prefix}vis.html"
+        js_path   = f"{web_prefix}vis.mjs"
+        css_path  = f"{web_prefix}vis.css"
+
+        app_info_path = f"{app_id}/info.json"
+
+        if html_path not in zf.namelist() or js_path not in zf.namelist():
+            _logger.warning(
+                "Visualiser files not found in zip (need %s/web/vis.html and %s/web/vis.mjs)",
+                app_id, app_id
+            )
+            raise RuntimeError(
+                f"Visualiser files not found in zip (need {app_id}/web/vis.html and {app_id}/web/vis.mjs)"
+            )
+
+        # Read files from zip into memory
+        html_str = zf.read(html_path).decode('utf-8')
+        js_str   = zf.read(js_path).decode('utf-8')
+        css_str  = zf.read(css_path).decode("utf-8") if css_path in zf.namelist() else None
+
+        zip_app_info = json.loads(zf.read(app_info_path).decode("utf-8")) if app_info_path in zf.namelist() else None
+
+        if app_info is None and zip_app_info is not None:
+            _logger.warning("App info found in zip file but not in recording attributes. The application visualiser may be incompatible with this recording.")
+        elif app_info is not None and zip_app_info is None:
+            _logger.warning("App info found in recording attributes but not in zip file. The application visualiser may be incompatible with this recording.")
+        elif app_info is not None and zip_app_info is not None:
+            _check_app_info(app_info, zip_app_info)
+
+        return app_id, html_str, js_str, css_str
+
+def _load_web_files_from_path(app_info: dict[str, Any] | None, app_path: Path) -> tuple[str, str, str, str | None]:
+    """Load visualiser files from a directory path."""
+
+    web_path = app_path / "web"
+    if not web_path.is_dir():
+        _logger.warning("No web/ directory found in %s", app_path)
+        raise RuntimeError(f"No web/ directory found in {app_path}")
+
+    html_file = web_path / "vis.html"
+    js_file   = web_path / "vis.mjs"
+    css_file  = web_path / "vis.css"
+
+    if not html_file.is_file() or not js_file.is_file():
+        _logger.warning("Visualiser files not found in %s (need vis.html and vis.mjs)", web_path)
+        raise RuntimeError(f"Visualiser files not found in {web_path} (need vis.html and vis.mjs)")
+
+    # Read files from disk
+    html_str = html_file.read_text(encoding="utf-8")
+    js_str   = js_file.read_text(encoding="utf-8")
+    css_str  = css_file.read_text(encoding="utf-8") if css_file.is_file() else None
+
+    file_zip_info = json.loads((app_path / "info.json").read_text(encoding="utf-8")) if (app_path / "info.json").is_file() else None
+
+    if app_info is None and file_zip_info is not None:
+        _logger.warning("App info found in the application path but not in recording attributes. The application visualiser may be incompatible with this recording.")
+    elif app_info is not None and file_zip_info is None:
+        _logger.warning("App info found in recording attributes but not in the application path. The application visualiser may be incompatible with this recording.")
+    elif app_info is not None and file_zip_info is not None:
+        _check_app_info(app_info, file_zip_info)
+
+    return app_path.name, html_str, js_str, css_str
+
+def _load_app_visualiser(app_info: dict[str, Any] | None, app_path: Path | None) -> str | None:
+    """
+    Load the app visualiser HTML from a directory or zip file.
 
     For directories: expects web/vis.html and web/vis.mjs
     For zip files: expects a single top-level directory containing web/vis.html and web/vis.mjs
@@ -112,76 +227,27 @@ def _load_app_visualiser(app_path: Path | None) -> str | None:
     # Check if it's a zip file
     if app_path.suffix.lower() == ".zip" and app_path.is_file():
         try:
-            with zipfile.ZipFile(app_path, 'r') as zf:
-                # Find the top-level directory in the zip
-                names = zf.namelist()
-                top_dirs = set()
-                for name in names:
-                    parts = name.split('/')
-                    if parts[0]:  # Skip empty parts
-                        top_dirs.add(parts[0])
-
-                if len(top_dirs) != 1:
-                    _logger.error("Zip file must contain exactly one top-level directory, found: %s", top_dirs)
-                    raise SystemExit(1)
-
-                app_id     = next(iter(top_dirs))
-                web_prefix = f"{app_id}/web/"
-
-                # Check for required visualiser files
-                html_path = f"{web_prefix}vis.html"
-                js_path   = f"{web_prefix}vis.mjs"
-                css_path  = f"{web_prefix}vis.css"
-
-                if html_path not in zf.namelist() or js_path not in zf.namelist():
-                    _logger.warning(
-                        "Visualiser files not found in zip (need %s/web/vis.html and %s/web/vis.mjs)",
-                        app_id, app_id
-                    )
-                    return None
-
-                # Read files from zip into memory
-                html_str = zf.read(html_path).decode('utf-8')
-                js_str   = zf.read(js_path).decode('utf-8')
-                css_str  = zf.read(css_path).decode("utf-8") if css_path in zf.namelist() else None
-
-                app_html = _setup_visualiser_html(app_id, html_str, js_str, css_str)
-                _logger.info("Loaded visualiser from zip %s", app_path)
-                return app_html
+            app_id, html_str, js_str, css_str = _load_web_files_from_zip(app_info, app_path)
 
         except zipfile.BadZipFile as e:
             _logger.error("Invalid zip file: %s", app_path)
-            raise RuntimeError(f"Invalid zip file: {app_path}") from e
+            return None
         except Exception as e:
             _logger.error("Error reading zip file: %s", e)
-            raise RuntimeError(f"Error reading zip file: {e}") from e
-
-    # Handle directory case
-    if not app_path.is_dir():
-        _logger.error("Application path '%s' does not exist or is not a zip file.", app_path)
-        raise RuntimeError(f"Application path '{app_path}' does not exist or is not a zip file.")
-
-    web_path = app_path / "web"
-    if web_path.is_dir():
-        html_file = web_path / "vis.html"
-        js_file   = web_path / "vis.mjs"
-        css_file  = web_path / "vis.css"
-
-        if not html_file.is_file() or not js_file.is_file():
-            _logger.warning("Visualiser files not found in %s (need vis.html and vis.mjs)", web_path)
+            return None
+    else:
+        # Handle directory case
+        if not app_path.is_dir():
+            _logger.error("Application path '%s' does not exist or is not a zip file.", app_path)
             return None
 
-        # Read files from disk
-        html_str = html_file.read_text(encoding="utf-8")
-        js_str   = js_file.read_text(encoding="utf-8")
-        css_str  = css_file.read_text(encoding="utf-8") if css_file.is_file() else None
+        try:
+            app_id, html_str, js_str, css_str = _load_web_files_from_path(app_info, app_path)
+        except Exception as e:
+            _logger.error("Error loading visualiser from directory: %s", e)
+            return None
 
-        app_html = _setup_visualiser_html(app_path.name, html_str, js_str, css_str)
-        _logger.info("Loaded visualiser from %s", web_path)
-        return app_html
-
-    _logger.warning("No web/ directory found in %s", app_path)
-    return None
+    return _setup_visualiser_html(app_id, html_str, js_str, css_str)
 
 def _load_recording_metadata(recording_file: Path) -> RecordingMetadata:
     """Load metadata from a recording file."""
@@ -204,6 +270,7 @@ def _load_recording_metadata(recording_file: Path) -> RecordingMetadata:
         duration_frames        = attrs.get("duration_frames", 0),
         start_timestamp        = attrs.get("start_timestamp", 0),
         data_stream_attributes = data_stream_attributes,
+        app_info               = attrs.get("app_info", None),
     )
 
     recording.close()
@@ -270,7 +337,7 @@ def _run_playback(
     def signal_handler(_signum: int, _frame) -> None:
         pass  # Just let the exception propagate
 
-    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Create and run the CLI controller
@@ -296,16 +363,7 @@ def _main() -> int:
     parser = argparse.ArgumentParser(
         description     = "Cortical Labs Recording Playback Tool",
         formatter_class = argparse.RawDescriptionHelpFormatter,
-        epilog          = """
-Controls:
-  SPACE                                   Toggle pause/play
-  Left/Right                              Skip ±5 seconds
-  Shift (Ctrl on Windows) + Left/Right    Skip ±1 minute
-  g                                       Go to specific timestamp
-  r                                       Restart
-  h / ?                                   Show help
-  q                                       Quit
-"""
+        epilog          = EPILOG,
     )
     parser.add_argument(
         "recording_file",
@@ -322,20 +380,18 @@ Controls:
     parser.add_argument(
         "--port",
         type    = int,
-        default = 1025,
-        help    = "WebSocket server port (default: 1025)"
+        default = BASE_WS_PORT,
+        help    = f"WebSocket server port (default: {BASE_WS_PORT})"
     )
     parser.add_argument(
         "--host",
         type    = str,
-        default = "127.0.0.1",
-        help    = "WebSocket server host (default: 127.0.0.1)"
+        default = BASE_HOST,
+        help    = f"WebSocket server host (default: {BASE_HOST})"
     )
     args = parser.parse_args()
 
     recording_file: Path = args.recording_file
-
-    os.environ["CL_SDK_WEBSOCKET_PORT"] = str(args.port)  # Pass port to WebSocket server via environment variable
 
     # Validate recording file
     if not recording_file.is_file():
@@ -343,8 +399,8 @@ Controls:
         return 1
 
     try:
-        app_html = _load_app_visualiser(args.app_directory)
         metadata = _load_recording_metadata(recording_file)
+        app_html = _load_app_visualiser(metadata.app_info, args.app_directory)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -365,4 +421,10 @@ Controls:
         return 1
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level    = logging.WARNING,
+        format   = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers = [logging.StreamHandler(sys.stdout)]
+    )
+
     sys.exit(_main())

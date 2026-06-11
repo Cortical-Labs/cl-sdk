@@ -1,27 +1,28 @@
 from __future__ import annotations
+
+import atexit
+import contextlib
 from collections.abc import Generator, Mapping
-from typing import Any, TypedDict, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, cast
 
 import numpy as np
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-from matplotlib.axes import Axes
-from matplotlib.gridspec import GridSpec
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
-import tables
-from tables.file import File
-from tables.table import Table
-from tables.attributeset import AttributeSet
-from tables.group import Group
-from tables.earray import EArray
+    from tables.file import File
+    from tables.table import Table
+    from tables.group import Group
+    from tables.earray import EArray
 
-from pathlib import Path
 
 from . import (
-    from_msgpacked, binary_search, binary_search_range,
-    builtins_only_unpickling, BlockedUnpicklingError
-    )
+    from_msgpacked,
+    binary_search,
+    binary_search_range,
+    restricted_unpickling
+)
 
 from ..analysis import (
     Array1DFloat,
@@ -35,7 +36,13 @@ from ..analysis import (
     AnalysisResultsFunctionalConnectivity
     )
 
+from ..error import UnsafeOperationError
+
 from ..import Spike
+
+#
+# RecordingView class definition
+#
 
 class RecordingView:
     """
@@ -59,13 +66,32 @@ class RecordingView:
     from cl import RecordingView
 
     file_path = "/path/to/recording.h5"
-    recording = RecordingView(file_path)
-    # Do something ...
-    recording.close()
+    with RecordingView(file_path) as recording:
+        # Do something ...
+        ...
     ```
     """
     file: File
     """ The underlying PyTables file. """
+
+    _is_open: bool
+    """ Whether this view currently owns an open PyTables file. """
+
+    _all_open_recordings: ClassVar[set[RecordingView]] = set()
+    """ All currently-open RecordingView instances. """
+
+    @staticmethod
+    def _close_file(file: Any) -> None:
+        """Close a PyTables file if it is still open."""
+        is_open = getattr(file, "isopen", False)
+        if is_open:
+            file.close()
+
+    @classmethod
+    def _close_all_open(cls) -> None:
+        """Close all open RecordingView files at interpreter shutdown."""
+        for recording_view in list(cls._all_open_recordings):
+            recording_view.close(safe_mode=True)
 
     attributes: AttributesDict
     """
@@ -86,19 +112,22 @@ class RecordingView:
     | git_tags           | `str`            | Metadata relating to the software version.                                                              |
     | git_status         | `str`            | Metadata relating to the software version.                                                              |
     | channel_count      | `int`            | Number of channels.                                                                                     |
-    | sampling_frequency | `int`            | Sampling frequency in Hz.                                                                               |
-    | frames_per_second  | `int`            | Number of frames per second, same as sampling frequency.                                                |
+    | sampling_frequency | `int`            | Sampling frequency in Hz, same as `frames_per_second` (Note 2).                                         |
+    | frames_per_second  | `int`            | Number of frames per second in Hz, same as `sampling_frequency` (Note 2).                               |
     | uV_per_sample_unit | `float`          | Multiply the recording sample values by this constant to obtain sample values as microvolts (uV).       |
     | duration_frames    | `int`            | Duration of this recording in frames.                                                                   |
     | duration_seconds   | `float`          | Duration of this recording in seconds.                                                                  |
     | start_timestamp    | `int`            | Timestamp of the first frame.                                                                           |
     | end_timestamp      | `int`            | Timestamp of the last frame.                                                                            |
-    | file_format        | `dict`           | See below.                                                                                              |
+    | file_format        | `dict`           | See below (Note 1).                                                                                     |
 
-    The `file_format` attribute contains information relating to the format of the recording as a `dict`.
-    This contains two attributes being `version` and `stim_and_spike_timestamps_relative_to_start`.
-    The latter, when `True`, indicates that the timestamps included for stims and spikes are relative to the
-    `start_timestamp` of the recording.
+    Notes:
+    1.  The `file_format` attribute contains information relating to the format of the recording as a `dict`.
+        This contains two attributes being `version` and `stim_and_spike_timestamps_relative_to_start`.
+        The latter, when `True`, indicates that the timestamps included for stims and spikes are relative to the
+        `start_timestamp` of the recording.
+    2.  Both `frames_per_second` and `sampling_frequency` give the same value. Use of `sampling_frequency` is discouraged as this attribute is
+        flagged for deprecation and may be removed in a future version.
 
     For example:
 
@@ -225,9 +254,15 @@ class RecordingView:
         Args:
             file_path: Path to the recording (`.h5`) file to be opened.
         """
+        self._is_open = False
         try:
-            with builtins_only_unpickling():
+            with restricted_unpickling():
+                import tables
                 self.file = tables.open_file(file_path, mode='r')
+
+                # Register cleanup so that files can be closed() if UnsafeOperationError raises
+                self._is_open = True
+                RecordingView._all_open_recordings.add(self)
 
                 # Helper function to check for object types in dtypes, which could indicate potentially unsafe pickled data
                 def dtype_has_object(self, dtype):
@@ -251,29 +286,27 @@ class RecordingView:
 
                     # Ban VLArray storing Python objects
                     if isinstance(node, tables.VLArray) and isinstance(node.atom, tables.ObjectAtom):
-                        raise BlockedUnpicklingError(f"ObjectAtom VLArray: {node._v_pathname}")
+                        raise UnsafeOperationError(f"ObjectAtom VLArray: {node._v_pathname}")
 
                     # Ban any ObjectAtom (covers other containers that use atoms)
                     if hasattr(node, "atom") and isinstance(getattr(node, "atom", None), tables.ObjectAtom):
-                        raise BlockedUnpicklingError(f"ObjectAtom node: {node._v_pathname}")
+                        raise UnsafeOperationError(f"ObjectAtom node: {node._v_pathname}")
 
                     # Ban object dtype arrays (Array/CArray/EArray/Table readouts)
                     # Many nodes expose .dtype; some expose .description/.coltypes etc.
                     dtype = getattr(node, "dtype", None)
                     if dtype is not None and dtype_has_object(self, dtype):
-                        raise BlockedUnpicklingError(f"Object dtype in node: {node._v_pathname} dtype={dtype}")
+                        raise UnsafeOperationError(f"Object dtype in node: {node._v_pathname} dtype={dtype}")
 
                     # Tables: also check column dtypes explicitly
                     if isinstance(node, tables.Table):
                         dtype = node.dtype
                         if dtype_has_object(self, dtype):
-                            raise BlockedUnpicklingError(f"Object column(s) in table: {node._v_pathname} dtype={dtype}")
-        except BlockedUnpicklingError as e:
-            try:
-                self.file.close()
-            except Exception:
-                pass
-            e.add_note(f"Refusing to open recording file {file_path}, as it contains potentially unsafe data (security risk).")
+                            raise UnsafeOperationError(f"Object column(s) in table: {node._v_pathname} dtype={dtype}")
+        except Exception as e:
+            self.close(safe_mode=True) # Ensure closure with any failure when opening a file
+            if isinstance(e, UnsafeOperationError):
+                e.add_note(f"Refusing to open recording file {file_path}, as it contains potentially unsafe data (security risk).")
             raise
 
         self.attributes = cast(AttributesDict, AttributesView(self.file.root._v_attrs))
@@ -291,9 +324,37 @@ class RecordingView:
         from cl.analysis._data_cache import _AnalysisDataCache
         self._analysis_cache = _AnalysisDataCache(file_path, self)
 
-    def close(self):
-        """ Close the underlying PyTables file. """
-        self.file.close()
+    def close(self, safe_mode: bool = False):
+        """
+        Close the underlying PyTables file.
+
+        Args:
+            safe_mode: When True, suppress any exception raised while closing.
+                       Intended for best-effort cleanup paths (finalizers,
+                       interpreter shutdown, error rollback) where the caller
+                       cannot meaningfully react to a failure.
+        """
+        if not self._is_open:
+            return
+
+        # Mark closed before the HDF5 close call so exceptions do not leave a
+        # race window that can attempt a second close later.
+        self._is_open = False
+        RecordingView._all_open_recordings.discard(self)
+
+        if safe_mode:
+            with contextlib.suppress(Exception):
+                RecordingView._close_file(self.file)
+        else:
+            RecordingView._close_file(self.file)
+
+    def __enter__(self):
+        """ Return this recording view for `with` statement use. """
+        return self
+
+    def __exit__(self, exception_type, exception_value, traceback):
+        """ Close the underlying PyTables file when leaving a `with` block. """
+        self.close()
 
     def __repr__(self):
         return (
@@ -307,11 +368,27 @@ class RecordingView:
             )
 
     def __del__(self):
-        self.close()
+        self.close(safe_mode=True)
 
     #
     # Analysis functions
     #
+
+    def analysis_timestamp_limit(
+        self,
+        minimum_timestamp: int | None = None,
+        maximum_timestamp: int | None = None
+        ):
+        """
+        Sets the timestamp range for all analysis function. When `None`, minimum
+        timestamp will be `0` and maximum timestamp will be the maximum timestamp
+        contained in the recording.
+
+        Args:
+            minimum_timestamp: Minimum timestamp (cannot be lower than 0).
+            maximum_timestamp: Maximum timestamp (cannot be greater than attributes["duration_frames"]).
+        """
+        self._analysis_cache.set_timestamp_range(minimum_timestamp, maximum_timestamp)
 
     def analyse_firing_stats(
         self,
@@ -632,6 +709,10 @@ class RecordingView:
             recording.plot_spike(spike)
         ```
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        import matplotlib.ticker as ticker
+
         if isinstance(spike, np.void) or isinstance(spike, tuple):
             timestamp, channel, samples = spike
         else:
@@ -689,7 +770,7 @@ class RecordingView:
         from matplotlib.gridspec import GridSpec
         from ..analysis._plots import _plot_spikes_and_stims_raster
 
-        sampling_frequency       = self.attributes["sampling_frequency"]
+        sampling_frequency       = self.attributes["frames_per_second"]
         duration_seconds         = self.attributes["duration_seconds"]
 
         spike_frames_per_channel = self._analysis_cache.get_spike_frames_by_channel()
@@ -734,6 +815,8 @@ class RecordingView:
         else:
             plt.show(block=True)
         plt.close()
+
+atexit.register(RecordingView._close_all_open)
 
 class AttributesView(Mapping):
     def __init__(self, h5_attributes):

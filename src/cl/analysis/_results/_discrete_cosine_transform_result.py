@@ -1,10 +1,12 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-from matplotlib.figure import Figure
-from matplotlib.gridspec import GridSpec
-from matplotlib.colors import Normalize, Colormap
+if TYPE_CHECKING:
+    from matplotlib.colors import Colormap
+    from matplotlib.figure import Figure
 
 from .. import Array2DFloat, AnalysisResult
 
@@ -48,6 +50,11 @@ class AnalysisResultDctFeatures(AnalysisResult):
         Returns:
             Figure: The figure used to create the plot.
         """
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        from matplotlib.colors import Normalize
+        from matplotlib.gridspec import GridSpec
+
         # Reference results data
         k          = self.k
         dct_height = self.dct_height_coefficients

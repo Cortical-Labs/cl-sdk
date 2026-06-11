@@ -8,15 +8,9 @@ CL API provides transparent control for all key tasks performed with the CL1 inc
 
 The CL API comes pre-installed with every CL1 device.
 
-Those without access to a CL1 can experiment with the CL API via the [CL SDK Simulator](#cl-sdk-simulator).
+Those without access to a CL1 can experiment with the CL API **locally** via the [CL SDK Simulator](#cl-sdk-simulator).
 
 The CL API and Simulator are intentionally designed to be drop-in replacements for one another. Any code developed against the Simulator can be executed on a physical CL1 system with minimal or no modification.
-
-To use the **Simulator** on your local device, simply install the `pip` package:
-
-```shell
-pip install cl-sdk
-```
 
 ## Quick start
 
@@ -68,7 +62,7 @@ with cl.open() as neurons:
         # Loop through each detected spike object
         for spike in tick.analysis.spikes:
             # Print out the spike object
-            print(spike
+            print(spike)
 ```
 
 Expected output:
@@ -186,8 +180,55 @@ Warning: Jitter detection is currently not supported in cl-sdk. This may lead to
 loop timing behaviour if your loop body takes a long time to execute.
 ```
 
-In some closed-loop experiments, it may be desirable to temporarily relax enforcement of per-iteration execution deadlines. The `Loop.recover_from_jitter()` method allows a user to opt-in to tolerate a single instance of lapse in loop body execution without triggering a `TimeoutError`. See the method definition for usage examples.
+In some closed-loop experiments, it may be desirable to temporarily relax enforcement of per-iteration execution deadlines. The `Loop.recover_from_jitter()` method allows the currently executing loop iteration to exceed the time budget without triggering a `TimeoutError`. While recovery is active, subsequent iterations are skipped until tick processing has caught up. In the following example, the loop recovers from jitter caused by `time.sleep()` in the second loop iteration:
 
+```python
+import cl
+import time
+
+TICKS_PER_SECOND = 100
+STOP_AFTER_TICKS = 10
+
+first_tick_time  = None
+
+def handle_recovery_tick(tick):
+    # Optional callback, called for skipped iterations during jitter recovery.
+    iteration_time_ms = (time.time() - first_tick_time) * 1000
+    print(f"RECOVERING FROM JITTER: tick.iteration={tick.iteration} at {round(iteration_time_ms)} ms")
+
+with cl.open() as neurons:
+    for tick in neurons.loop(TICKS_PER_SECOND, stop_after_ticks=STOP_AFTER_TICKS):
+        if tick.iteration == 0:
+            first_tick_time = time.time()
+
+        iteration_time_ms = (time.time() - first_tick_time) * 1000
+        print(f"NORMAL TICK:            tick.iteration={tick.iteration} at {round(iteration_time_ms)} ms")
+
+        if tick.iteration == 1:
+            # In the 2nd iteration, sleep for 50ms. This would
+            # normally cause a jitter error, because our loop
+            # tick time budget at 100 ticks per second is less
+            # than 10ms per tick.
+            time.sleep(50 / 1000)
+
+            # However, since we know we've done something slow
+            # in this iteration, we can ask the system to
+            # recover and continue. If you comment out this
+            # line, you'll see a jitter error.
+            tick.loop.recover_from_jitter(handle_recovery_tick)
+
+# Expected output (note the timestamps):
+# NORMAL TICK:            tick.iteration=0 at 0 ms
+# NORMAL TICK:            tick.iteration=1 at 10 ms
+# RECOVERING FROM JITTER: tick.iteration=2 at 60 ms
+# RECOVERING FROM JITTER: tick.iteration=3 at 60 ms
+# RECOVERING FROM JITTER: tick.iteration=4 at 61 ms
+# RECOVERING FROM JITTER: tick.iteration=5 at 61 ms
+# RECOVERING FROM JITTER: tick.iteration=6 at 61 ms
+# NORMAL TICK:            tick.iteration=7 at 70 ms
+# NORMAL TICK:            tick.iteration=8 at 80 ms
+# NORMAL TICK:            tick.iteration=9 at 90 ms
+```
 
 ## Data Streams
 
@@ -254,20 +295,24 @@ from cl import RecordingView
 
 # Load a recording file from CL1 using RecordingView
 # Files are timestampted in a `YYYY_MM_DD_HH_MM_SS` format
+with RecordingView("/data/recordings/2025_10_29_11_53_42_my_application.h5") as recording:
+    # Access core datasets
+    print(recording.samples)        # Raw voltage samples array with shape (duration_frames × channel_count)
+    print(recording.spikes)         # Detected spike events with metadata
+    print(recording.stims)          # Stimulus timestamps and channels
+    print(recording.attributes)     # Global recording metadata
+    print(recording.data_streams)   # User defined data streams (e.g., gamestate)
+
+    # Example: Count total spikes
+    num_spikes = len(recording.spikes)
+    print(f"Detected spikes: {num_spikes}")
+```
+
+We recommend using the `with` context manager to close the underlying HDF5 file automatically. If managing manually, call `RecordingView.close()` to avoid leaving the file open.
+
+```python
 recording = RecordingView("/data/recordings/2025_10_29_11_53_42_my_application.h5")
-
-# Access core datasets
-print(recording.samples)        # Raw voltage samples array with shape (duration_frames × channel_count)
-print(recording.spikes)         # Detected spike events with metadata
-print(recording.stims)          # Stimulus timestamps and channels
-print(recording.attributes)     # Global recording metadata
-print(recording.data_streams)   # User defined data streams (e.g., gamestate)
-
-# Example: Count total spikes
-num_spikes = len(recording.spikes)
-print(f"Detected spikes: {num_spikes}")
-
-# Close file when done
+# Your code here
 recording.close()
 ```
 
@@ -278,12 +323,12 @@ The same can be done for a data stream object inside the HDF5 file. The followin
 ```python
 from cl import RecordingView
 
-recording = RecordingView("/data/recordings/2025_10_29_11_53_42_my_application.h5")
-stream    = recording.data_streams["example_data_stream"]
+with RecordingView("/data/recordings/2025_10_29_11_53_42_my_application.h5") as recording:
+    stream = recording.data_streams["example_data_stream"]
 
-# Loop through and extract each timestamp and item:
-for timestamp, data in stream.items():
-    print('\n', timestamp, data)
+    # Loop through and extract each timestamp and item:
+    for timestamp, data in stream.items():
+        print('\n', timestamp, data)
 ```
 
 This would output:
@@ -401,16 +446,38 @@ Since only one type of `BurstDesign` was defined, both sets of channels will bur
 
 The [CL SDK Simulator](https://github.com/Cortical-Labs/cl-sdk) enables local application development and debugging by maintaining 1:1 interface parity with the on-device API. Data is [simulated](#simulation-from-a-recording) from either randomly generated or replayed from recordings and can run either in wall-clock or [accelerated modes](#speed-of-simulation).
 
-## Simulation from a recording
+**Important:** The Simulator is a **local** development tool designed to facilitate easy application deployment to CL1 devices. Because it generates non-learning control data that does not respond to stimulation, it should be used solely for establishing baseline controls and must not be relied upon for experimental purposes.
 
-Spikes and samples is simulated by replaying recordings as set by the `CL_SDK_REPLAY_PATH` environment variable in an `.env` file. If this is omitted, a temporary recording with randomly generated samples and spikes will be used that is based on a Poisson distribution and the following optional environment variables:
+## Installation
+
+To use the Simulator on your **local device**, simply install the `pip` package:
+
+```shell
+pip install cl-sdk
+```
+
+## Data Sources Module
+
+Data used by the simulator is defined by the `cl.sim` module. Note that this module should only be used for the CL-SDK and is **not** available on the CL1.
+
+The SDK ships two built-in sources:
+1. Simulation using [randomly generated data](#random-simulation) (default), and
+2. Simulation by [replaying data from a recording](#simulation-from-a-recording).
+
+## Random simulation
+
+The default built-in data source randomly generates samples and spikes on the go from a Poisson distribution. Users can optionally change the following parameters via environment variables:
 
 - `CL_SDK_SAMPLE_MEAN`: Mean samples value (default 170). This value will be in microvolts when multiplied by the constant "uV_per_sample_unit" in the recording attributes;
 - `CL_SDK_SPIKE_PERCENTILE`: Percentile threshold for sample values, above which will correspond to a spike (default 99.995);
-- `CL_SDK_DURATION_SEC`: Duration of the temporary recording (default 60); and
-- `CL_SDK_RANDOM_SEED`: Random seed (defaults to Unix time).
+- `CL_SDK_RANDOM_SEED`: Random seed (default None). Setting a seed enables deterministic data generation.
+- `CL_SDK_SPIKE_VISIBILITY`: Whether to amplify the sample value of detected spikes to increase their visibility in the sample data (default 0, i.e., no amplification).
 
-The starting position of the replay recording will be randomised every time `cl.open()` is called. This can be overriden by setting `CL_SDK_REPLAY_START_OFFSET`, where a value of `0` indicates the first frame of the recording.
+The randomly generated data is computed deterministically from the parameters above. Data can be reproducible with every run with the same parameters and random seed.
+
+## Simulation from a recording
+
+Spikes and samples can simulated by replaying recordings by setting the `CL_SDK_REPLAY_PATH` environment variable in an `.env` file. The starting position of the replay recording will be randomised every time `cl.open()` is called. This can be overriden by setting `CL_SDK_REPLAY_START_OFFSET`, where a value of `0` indicates the first frame of the recording.
 
 ## Speed of simulation
 
@@ -421,9 +488,21 @@ The Simulator can operate in two timing modes:
 
 Accelerated time mode can be enabled by setting `CL_SDK_ACCELERATED_TIME=1` environment variable in the `.env` file. When enabled, passage of time will be decouple from the system wall clock time, enabling accelerated testing of applications.
 
-## Visualisations
+## Visualisation
 
-Basic visualisation are supported by the Simulator. To enable a local WebSocket server for visualization and testing, set the environment variable `CL_SDK_WEBSOCKET=1`. The server will start on port 1025 (configurable via `CL_SDK_WEBSOCKET_PORT`).
+Basic visualisation is supported by the Simulator. A local WebSocket server for visualization and testing is enabled by default. You can explicitly enable it by setting `CL_SDK_VISUALISATION=1`, or disable it by setting `CL_SDK_VISUALISATION=0`. The server will automatically find an available port starting from 1025. Visualisations cannot be used concurrently with accelerated time mode.
+
+# Important Notes
+
+## Recording of Raw Data in Bundled Applications
+
+Bundled Applications on the CL1 will **not** include raw samples in recordings by default. Users that requiring raw samples should ensure to turn this option on in the Application configuration. Be advised that including raw samples will significantly increase data storage requirements.
+
+## Limitations for individual stims
+
+Performing individual stimulations in `Neurons.stim()` or `StimPlan.stim()` is subject to the following limitations:
+- There is a maximum limit to the number of individual stims that can be queued and a `ChannelQueueFull` exception will be raised if exceeded. Users are encouraged to consider use of burst stims (i.e. with `BurstDesign`) for periodically repeated stims where appropriate.
+- Individual stims cannot be performed faster than the maximum stimulation frequency of 200 Hz on any one channel. This limit is enforced to protect living cells when running on a real CL1.
 
 # Citing CL API
 

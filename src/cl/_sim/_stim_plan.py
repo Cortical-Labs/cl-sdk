@@ -3,10 +3,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from . import BurstDesign, ChannelSet, StimDesign
+from .. import BurstDesign, ChannelSet, StimDesign
 
 if TYPE_CHECKING:
-    from . import Neurons
+    from .. import Neurons
 
 FROZEN_ERROR_MSG = "Cannot modify a StimPlan after it has been used."
 
@@ -226,17 +226,28 @@ class StimPlan:
             at_timestamp: Optionally, execute this `StimPlan` at a specified timestamp.
                           `StimPlan` will run immediately if timestamp is in the past.
         """
-        now          = self._neurons.timestamp()
-        timestamp    = at_timestamp if (at_timestamp is not None) and (at_timestamp >= now) else now
+        from ..neurons import _to_external_ts, _to_internal_ts
+
+        command_ts = self._neurons._stim_command_timestamp()
+        if at_timestamp is None:
+            internal_ts = command_ts
+        else:
+            now = _to_external_ts(command_ts)
+            internal_ts = (
+                _to_internal_ts(at_timestamp)
+                if at_timestamp >= now
+                else command_ts
+            )
         self._frozen = True
         operations   = self._operations
 
         if self.channels_to_interrupt is not None:
-            # Insert an interrupt command at the start of the operation list
-            operations.insert(0, Operation(
+            # Include the configured interrupt at the start of each run without
+            # mutating the frozen plan's operation list.
+            operations = [Operation(
                 op   = self._neurons._interrupt_queued_stims,
                 args = (self.channels_to_interrupt,)
-                ))
+                ), *operations]
 
         for operation in operations:
-            operation.op(timestamp, *operation.args)
+            operation.op(internal_ts, *operation.args)
