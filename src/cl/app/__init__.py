@@ -388,8 +388,8 @@ canvas {
 ```
 """
 
-from . import init, model, pack, run
 from .base import BaseApplication, BaseApplicationConfig, OutputType, RunSummary
+from . import init, model, pack, run, util
 
 __all__ = (
     "BaseApplicationConfig",
@@ -399,5 +399,6 @@ __all__ = (
     "model",
     "init",
     "pack",
-    "run"
+    "run",
+    "util",
 )

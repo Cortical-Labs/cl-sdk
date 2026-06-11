@@ -4,16 +4,16 @@ import math
 import sys
 import time
 from collections.abc import Callable, Generator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
-from . import DetectionResult
-from .util import deprecated, frames_to_approximate_seconds
+from .. import DetectionResult
+from ..util import deprecated, frames_to_approximate_seconds
 
 if TYPE_CHECKING:
     import numpy as np
     from numpy import ndarray
 
-    from . import Neurons
+    from .. import Neurons
 
 _MIN_JITTER_TOLERANCE: int = 20
 """ (Simulator only) Allow a small amount of jitter as desktop OS will likely have higher latency than CL1. """
@@ -115,6 +115,9 @@ class Loop:
         self._frames_per_tick           = int(neurons.get_frames_per_second() // ticks_per_second)
         self._jitter_tolerance_frames   = max(int(2**31 - 1 if ignore_jitter else jitter_tolerance_frames), _MIN_JITTER_TOLERANCE)
 
+        # Rate multiplier: internal (50kHz) / external (25kHz)
+        self._rate_mul                  = neurons._frames_per_second // neurons.get_frames_per_second()
+
         # This is later updated to the timestamp of the first loop iteration.
         self._start_timestamp: int | str = "invalid timestamp"
 
@@ -161,165 +164,196 @@ class Loop:
         frames_per_second       = neurons.get_frames_per_second()
         frames_per_ns           = frames_per_second / 1_000_000_000
         jitter_tolerance_frames = self._jitter_tolerance_frames
-        read_frames             = neurons.read
+        read_frames             = neurons._read_loop_frames
         read_spikes             = neurons._read_spikes
-        read_stims              = neurons._read_and_reset_stim_cache
 
         use_accelerated_time    = neurons._use_accelerated_time
 
-        # Timing variables
+        # Rate multiplier for converting between external (25kHz) and internal (50kHz) stim timestamps
+        rate_mul                = self._rate_mul
+
+        # Timing variables (external 25kHz for user-facing values)
         start_ts                = timestamp()
         next_ts                 = start_ts
         next_deadline_ts        = next_ts + frames_per_tick + jitter_tolerance_frames
         self._start_timestamp   = start_ts
 
-        # Mark that we're in a loop and set initial deadline
+        # Mark that we're in a loop and set internal 50kHz values for stim scheduling and deadline checking
         neurons._in_loop = True
-        neurons._loop_deadline_ts = next_deadline_ts
-        # Base timestamp for stim scheduling is the start of the NEXT tick
-        # (i.e., the end of the current tick), since user code runs during the tick
-        neurons._loop_tick_timestamp = start_ts + frames_per_tick
+        neurons._loop_deadline_ts    = next_deadline_ts * rate_mul
+        neurons._loop_tick_timestamp = (start_ts + frames_per_tick) * rate_mul
 
-        # In accelerated mode, request the first batch of data from the producer
-        # Request data for first tick only to avoid running too far ahead
+        # In accelerated mode, request the first batch of data from the producer (25kHz buffer)
         if use_accelerated_time and neurons._shared_buffer is not None:
+            neurons._publish_stims_to_buffer_until((start_ts + frames_per_tick) * rate_mul)
             neurons._shared_buffer.requested_timestamp = start_ts + frames_per_tick
-
-        neurons._last_stim_read_ts = start_ts
 
         # Wall clock timing for accelerated mode jitter detection
         # Will be reset after first iteration to exclude initialization overhead
         wall_start = time.perf_counter_ns()
 
-        print("Warning: Jitter detection is currently not supported in cl-sdk. This may lead to unexpected loop timing behaviour if your loop body takes a long time to execute.", file=sys.stderr)
+        if not Loop._jitter_detection_warned:
+            Loop._jitter_detection_warned = True
+            print("Warning: Jitter detection is currently not supported in cl-sdk. This may lead to unexpected loop timing behaviour if your loop body takes a long time to execute.", file=sys.stderr)
 
-        while tick.iteration < self._stop_after_ticks:
-            now = timestamp()
+        try:
+            while tick.iteration < self._stop_after_ticks:
+                now = timestamp()
 
-            # For jitter checking, we need different approaches for different modes:
-            # - Real-time mode: use producer's timestamp only, since it runs in a separate
-            #   process and keeps real time independently. Mixing wall clock would cause
-            #   false positives due to IPC latency.
-            # - Accelerated mode: use wall clock to detect slow Python loop bodies (e.g.,
-            #   time.sleep()). Add 10% of elapsed simulated time as extra tolerance to allow
-            #   for normal processing overhead that accumulates over long runs.
-            if use_accelerated_time:
-                # Skip wall clock jitter check for first iteration (allows initialization overhead)
-                if tick.iteration == 0:
-                    effective_deadline = next_deadline_ts
+                # For jitter checking, we need different approaches for different modes:
+                # - Real-time mode: use producer's timestamp only, since it runs in a separate
+                #   process and keeps real time independently. Mixing wall clock would cause
+                #   false positives due to IPC latency.
+                # - Accelerated mode: use wall clock to detect slow Python loop bodies (e.g.,
+                #   time.sleep()). Add 10% of elapsed simulated time as extra tolerance to allow
+                #   for normal processing overhead that accumulates over long runs.
+                if use_accelerated_time:
+                    # Skip wall clock jitter check for first iteration (allows initialization overhead)
+                    if tick.iteration == 0:
+                        effective_deadline = next_deadline_ts
+                    else:
+                        wall_elapsed_ns = time.perf_counter_ns() - wall_start
+                        wall_elapsed_frames = int(wall_elapsed_ns * frames_per_ns)
+                        now = max(now, start_ts + wall_elapsed_frames)
+                        # Add proportional tolerance: allow wall time to be up to 2x simulated time.
+                        # This allows for normal Python processing overhead that accumulates over
+                        # long runs (e.g., assertions, logging), while still catching deliberate
+                        # sleeps that would make wall time >>> simulated time.
+                        simulated_elapsed = timestamp() - start_ts
+                        effective_deadline = next_deadline_ts + simulated_elapsed  # 100% tolerance
                 else:
-                    wall_elapsed_ns = time.perf_counter_ns() - wall_start
-                    wall_elapsed_frames = int(wall_elapsed_ns * frames_per_ns)
-                    now = max(now, start_ts + wall_elapsed_frames)
-                    # Add proportional tolerance: allow wall time to be up to 2x simulated time.
-                    # This allows for normal Python processing overhead that accumulates over
-                    # long runs (e.g., assertions, logging), while still catching deliberate
-                    # sleeps that would make wall time >>> simulated time.
-                    simulated_elapsed = timestamp() - start_ts
-                    effective_deadline = next_deadline_ts + simulated_elapsed  # 100% tolerance
-            else:
-                effective_deadline = next_deadline_ts
+                    effective_deadline = next_deadline_ts
 
-            #
-            # Handle jitter and jitter recovery states
-            #
-            loop_is_late = now > effective_deadline
-            if not self._jitter_recovery_enabled:
-                # Normal loop operation without jitter recovery, which may lead to
-                # jitter failure if late
-                if loop_is_late:
-                    self._handle_jitter_failure(start_ts, next_ts, frames_per_tick, now, tick)
+                #
+                # Handle jitter and jitter recovery states
+                #
+                loop_is_late = now > effective_deadline
+                if not self._jitter_recovery_enabled:
+                    # Normal loop operation without jitter recovery, which may lead to
+                    # jitter failure if late
+                    if loop_is_late:
+                        self._handle_jitter_failure(start_ts, next_ts, frames_per_tick, now, tick)
 
-            # Jitter recovery is enabled, handle all situations below
-            elif not loop_is_late:
-                # Loop has caught up timing-wise, but only exit recovery if we've reached
-                # the target iteration (to prevent early exit due to timing variations)
-                if self._jitter_recovery_target_iteration == 0 or tick.iteration >= self._jitter_recovery_target_iteration:
-                    self._jitter_recovery_reset()
+                # Jitter recovery is enabled, handle all situations below
+                elif not loop_is_late:
+                    # Loop has caught up timing-wise, but only exit recovery if we've reached
+                    # the target iteration (to prevent early exit due to timing variations)
+                    if self._jitter_recovery_target_iteration == 0 or tick.iteration >= self._jitter_recovery_target_iteration:
+                        self._jitter_recovery_reset()
 
-            elif self._jitter_recovery_timeout_timestamp == 0:
-                # First iteration with jitter recovery enabled
-                # Calculate which iteration we should resume at based on how far behind we are
-                # This makes recovery deterministic regardless of producer timing variations
-                self._jitter_recovery_target_iteration = (now - start_ts) // frames_per_tick
+                elif self._jitter_recovery_timeout_timestamp == 0:
+                    # First iteration with jitter recovery enabled
+                    # Calculate which iteration we should resume at based on how far behind we are
+                    # This makes recovery deterministic regardless of producer timing variations
+                    self._jitter_recovery_target_iteration = (now - start_ts) // frames_per_tick
 
-                # Calculate and set time limit for loop to catch up
-                self._jitter_recovery_timeout_timestamp = \
-                        int(now + (self._jitter_recovery_timeout_sec * self._neurons._frames_per_second))
+                    # Calculate and set time limit for loop to catch up
+                    self._jitter_recovery_timeout_timestamp = \
+                            int(now + (self._jitter_recovery_timeout_sec * self._neurons.get_frames_per_second()))
 
-            elif now >= self._jitter_recovery_timeout_timestamp:
-                # Jitter recovery is running but we have exceeded timeout before recovering
-                raise TimeoutError(
-                    "Loop fell too far behind and jitter recovery "
-                    f"could not complete within {self._jitter_recovery_timeout_sec:.3f} seconds."
+                elif now >= self._jitter_recovery_timeout_timestamp:
+                    # Jitter recovery is running but we have exceeded timeout before recovering
+                    raise TimeoutError(
+                        "Loop fell too far behind and jitter recovery "
+                        f"could not complete within {self._jitter_recovery_timeout_sec:.3f} seconds."
+                        )
+
+                #
+                # Read the next set of frames, spikes and stims
+                #
+                tick._timestamp               = next_ts
+                tick.iteration_timestamp      = next_ts + frames_per_tick
+                tick.iteration_next_timestamp = next_ts + (2 * frames_per_tick)
+
+                # Update internal 50kHz timestamps for stim scheduling and deadline checking
+                neurons._loop_deadline_ts    = next_deadline_ts * rate_mul
+                neurons._loop_tick_timestamp = (next_ts + frames_per_tick) * rate_mul
+
+                # In accelerated mode, wait for producer to write data for this tick
+                # (data was requested at end of previous iteration)
+                if use_accelerated_time and neurons._shared_buffer is not None:
+                    target_ts = next_ts + frames_per_tick
+                    if not neurons._shared_buffer.wait_for_timestamp(target_ts, timeout_seconds=0.1):
+                        raise TimeoutError(f"Timeout waiting for timestamp {target_ts}")
+                # read_frames uses external 25kHz parameters; read_spikes uses internal 50kHz
+                tick.frames    = read_frames(frames_per_tick, next_ts)
+
+                # Read stims for this tick AND write to shared buffer in a single
+                # call. This ensures the exact same stims are returned to the user
+                # and committed to the ring buffer. Writing happens BEFORE yield so
+                # the stims represent committed facts (before user code can interrupt).
+                tick_stims     = neurons._read_stims(
+                    next_ts * rate_mul,
+                    (next_ts + frames_per_tick) * rate_mul,
+                    write_to_buffer=True,
+                )
+                tick.analysis  = \
+                    DetectionResult(
+                        start_timestamp = next_ts,
+                        stop_timestamp  = next_ts + frames_per_tick,
+                        spikes          = read_spikes(frames_per_tick * rate_mul, next_ts * rate_mul),
+                        stims           = tick_stims,
                     )
 
-            #
-            # Read the next set of frames, spikes and stims
-            #
-            tick._timestamp               = next_ts
-            tick.iteration_timestamp      = next_ts + frames_per_tick
-            tick.iteration_next_timestamp = next_ts + (2 * frames_per_tick)
+                #
+                # Handle loop tick behaviour
+                #
+                if self._jitter_recovery_enabled:
+                    # In recovery mode - call callback or skip to catch up
+                    if self._jitter_recovery_callback is not None:
+                        self._jitter_recovery_callback(tick)
+                    # else: skip tick to allow loop to catch up
 
-            # Update the jitter deadline and tick timestamp for this iteration
-            neurons._loop_deadline_ts = next_deadline_ts
-            # Base timestamp for stim scheduling is the start of the NEXT tick
-            # (i.e., the end of the current tick), since user code runs during the tick
-            neurons._loop_tick_timestamp = next_ts + frames_per_tick
+                else:
+                    # Normal operation - yield tick
+                    yield tick
 
-            # In accelerated mode, wait for producer to write data for this tick
-            # (data was requested at end of previous iteration)
+                # Commit settled stim updates once per tick, but only up to the
+                # next loop-body timestamp. The next tick may still causally
+                # interrupt anything at or after that boundary.
+                if not use_accelerated_time and neurons._shared_buffer is not None:
+                    neurons._publish_stims_to_buffer_until((next_ts + (2 * frames_per_tick)) * rate_mul)
+
+                # After user code runs, request next tick's data from producer
+                # This triggers producer to process commands (including queued stims)
+                # Prepare for the next tick (increment counters first)
+                next_ts += frames_per_tick
+                next_deadline_ts += frames_per_tick
+                tick.iteration += 1
+
+                if use_accelerated_time and neurons._shared_buffer is not None:
+                    # Keep recording subprocesses inside the ring window in accelerated mode.
+                    while neurons._recordings:
+                        active_recordings = [
+                            recording for recording in neurons._recordings
+                            if (
+                                getattr(recording, "status", None) == "started"
+                                and getattr(recording, "_mode", None) == "process"
+                            )
+                        ]
+                        if not active_recordings:
+                            break
+                        oldest_recording_ts = min(
+                            getattr(recording, "_process_read_ts", next_ts)
+                            for recording in active_recordings
+                        )
+                        max_lag = neurons._shared_buffer.buffer_duration_frames // 2
+                        if next_ts - oldest_recording_ts <= max_lag:
+                            break
+                        time.sleep(0.001)
+
+                    # Request data for next tick only to keep producer one tick ahead (25kHz buffer)
+                    neurons._publish_stims_to_buffer_until((next_ts + frames_per_tick) * rate_mul)
+                    neurons._shared_buffer.requested_timestamp = next_ts + frames_per_tick
+        finally:
+            # Loop finished - pause producer in accelerated mode to prevent it racing ahead
             if use_accelerated_time and neurons._shared_buffer is not None:
-                target_ts = next_ts + frames_per_tick
-                for _ in range(1000):  # Max 100ms wait
-                    current_write = neurons._shared_buffer.write_timestamp
-                    if current_write >= target_ts:
-                        # write_timestamp is updated after frames but before stims
-                        # Sleep briefly to ensure stims are also written
-                        time.sleep(0.0001)  # 100μs to allow stim writes to complete
-                        break
-                    time.sleep(0.0001)  # 100μs
+                neurons._shared_buffer.requested_timestamp = 0
 
-            tick.frames    = read_frames(frames_per_tick, next_ts)
-            tick.analysis  = \
-                DetectionResult(
-                    start_timestamp = next_ts,
-                    stop_timestamp  = next_ts + frames_per_tick,
-                    spikes          = read_spikes(frames_per_tick, next_ts),
-                    stims           = read_stims(),
-                )
-
-            #
-            # Handle loop tick behaviour
-            #
-            if self._jitter_recovery_enabled:
-                # In recovery mode - call callback or skip to catch up
-                if self._jitter_recovery_callback is not None:
-                    self._jitter_recovery_callback(tick)
-                # else: skip tick to allow loop to catch up
-
-            else:
-                # Normal operation - yield tick
-                yield tick
-
-            # After user code runs, request next tick's data from producer
-            # This triggers producer to process commands (including queued stims)
-            # Prepare for the next tick (increment counters first)
-            next_ts += frames_per_tick
-            next_deadline_ts += frames_per_tick
-            tick.iteration += 1
-
-            if use_accelerated_time and neurons._shared_buffer is not None:
-                # Request data for next tick only to keep producer one tick ahead
-                neurons._shared_buffer.requested_timestamp = next_ts + frames_per_tick
-        # Loop finished - pause producer in accelerated mode to prevent it racing ahead
-        if use_accelerated_time and neurons._shared_buffer is not None:
-            neurons._shared_buffer.requested_timestamp = 0
-
-        # Clear loop flag and deadline
-        neurons._in_loop             = False
-        neurons._loop_tick_timestamp = None
-        neurons._loop_deadline_ts    = None
+            # Clear loop flag and deadline even if the generator is closed early.
+            neurons._in_loop             = False
+            neurons._loop_tick_timestamp = None
+            neurons._loop_deadline_ts    = None
 
         return
 
@@ -416,6 +450,9 @@ class Loop:
     #
     # (Private) Jitter handling and recovery
     #
+
+    _jitter_detection_warned: ClassVar[bool] = False
+    """ (Simulator only) Whether a warning about jitter detection has been printed. """
 
     _jitter_recovery_enabled: bool = False
     """ (Simulator only) Indicates whether the loop is in jitter recovery mode. """

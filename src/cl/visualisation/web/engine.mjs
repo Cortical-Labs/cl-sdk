@@ -6,10 +6,10 @@
 //
 // These values are injected from Python:
 //
-//  const uniqueId      = '{unique_id}';              // ID of containing div
-//  const dataStreams   = json.dumps(data_streams);   // Array of data stream names
-//  const sshIp         = '{ssh_ip}';                 // SSH device IP, only used in VSCode Server mode (null if not used)
-//  const websocketPort = 1025;                       // WebSocket server port
+//  const uniqueId       = '{unique_id}';              // ID of containing div
+//  const dataStreams     = json.dumps(data_streams);   // Array of data stream names
+//  const sshIp          = '{ssh_ip}';                 // SSH device IP, only used in VSCode Server mode (null if not used)
+//  const configBaseUrl  = '{config_base_url}';        // (Jupyter only) Base URL for /_/config endpoint (null when served from HTTP server)
 //
 
 const visualisationDiv  = document.getElementById(uniqueId);
@@ -84,6 +84,8 @@ if (!outputContainer)
 let ws;
 let connectInterval = initialConnectIntervalMs;
 let scheduledReconnect;
+let connectionAttempt = 0;
+let isConnecting      = false;
 
 let hasBeenRemoved      = false;
 let animationRequestId  = null;
@@ -93,6 +95,10 @@ let updateQueues;
 let latestTimestamps;
 let baseTimestampMs;
 let baseTimestampFrames;
+let lastRenderTimestampMs;
+
+// Cached WebSocket URL from /_/config endpoint
+let cachedWsUrl = null;
 
 function reset()
 {
@@ -108,6 +114,29 @@ function reset()
         latestTimestamps[dataStreamName]    = -1;
         updateQueues[dataStreamName]        = [];
     }
+}
+
+function setFramesPerSecond(newFramesPerSecond)
+{
+    if (!newFramesPerSecond || newFramesPerSecond <= 0)
+        return;
+
+    if (framesPerSecond === undefined || framesPerSecond == newFramesPerSecond)
+    {
+        framesPerSecond = newFramesPerSecond;
+        return;
+    }
+
+    const timestampMs = lastRenderTimestampMs ?? performance.now();
+    if (baseTimestampMs !== null && baseTimestampFrames !== null && timestampMs >= baseTimestampMs)
+    {
+        const relativeMs     = timestampMs - baseTimestampMs;
+        const relativeFrames = Math.floor(relativeMs * framesPerSecond / 1000);
+        baseTimestampFrames  = baseTimestampFrames + relativeFrames;
+        baseTimestampMs      = timestampMs;
+    }
+
+    framesPerSecond = newFramesPerSecond;
 }
 
 // If the visualiser is removed from the DOM, close the connection
@@ -128,10 +157,12 @@ mutationObserver.observe(outputContainer, { childList: true, subtree: true });
 
 function render(timestampMs)
 {
+    lastRenderTimestampMs = timestampMs;
+
     // Keep the render loop going
     animationRequestId = requestAnimationFrame(render);
 
-    if (!baseTimestampMs)
+    if (baseTimestampMs === null)
     {
         // Check for an update in each queue, if we have any we sync on the lowest timestamp
         let lowestTimestamp = Number.MAX_SAFE_INTEGER;
@@ -209,6 +240,12 @@ function connect()
         ws = undefined;
     }
 
+    if (isConnecting)
+        return;
+
+    isConnecting = true;
+    const thisConnectionAttempt = ++connectionAttempt;
+
     function scheduleReconnect()
     {
         console.log('Scheduling reconnect in ' + connectInterval + ' ms');
@@ -241,25 +278,68 @@ function connect()
     if (!document.body.contains(visualisationDiv))
     {
         console.log('Visualiser has been removed from the DOM, not connecting');
+        isConnecting = false;
         return;
     }
 
-    // The hostname is not valid when running under vscode jupyter
-    // TODO: Provide way to override hostname from the notebook
-    const hostname          = getRobustHostname();
-    const protocol          = getWsProtocol();
-    const port              = websocketPort || 1025;
-    const connectionString  = `${protocol}://${hostname}:${port}/_/ws/live_streaming`;
+    // Fetch the WebSocket URL from the /_/config endpoint
+    // configBaseUrl is optionally injected for Jupyter notebook mode (where relative fetch won't work)
+    async function getWebSocketUrl()
+    {
+        if (cachedWsUrl)
+            return cachedWsUrl;
 
-    ws = new WebSocket(connectionString);
+        const baseUrl = (typeof configBaseUrl !== 'undefined' && configBaseUrl) ? configBaseUrl : '';
 
-    // We want ArrayBuffer objects when receiving binary messages
-    ws.binaryType = 'arraybuffer';
+        try
+        {
+            const response = await fetch(baseUrl + '/_/config');
+            if (response.ok)
+            {
+                const config = await response.json();
+                if (config.live_streaming_url)
+                {
+                    cachedWsUrl = config.live_streaming_url;
+                    console.log('Using live streaming URL from config:', cachedWsUrl);
+                    return cachedWsUrl;
+                }
+                else if (config.websocket_url)
+                {
+                    cachedWsUrl = config.websocket_url + '/_/ws/live_streaming';
+                    console.log('Using WebSocket URL from config:', cachedWsUrl);
+                    return cachedWsUrl;
+                }
+            }
+        }
+        catch (e)
+        {
+            console.log('Failed to fetch /_/config:', e.message);
+        }
+
+        // Fallback: construct URL from location (works when served from HTTP server)
+        const hostname = getRobustHostname();
+        const protocol = getWsProtocol();
+        cachedWsUrl = `${protocol}://${hostname}/_/ws/live_streaming`;
+        console.log('Using fallback WebSocket URL:', cachedWsUrl);
+        return cachedWsUrl;
+    }
+
+    getWebSocketUrl().then(connectionString =>
+    {
+        if (!isConnecting || thisConnectionAttempt != connectionAttempt)
+            return;
+
+        ws = new WebSocket(connectionString);
+
+        // We want ArrayBuffer objects when receiving binary messages
+        ws.binaryType = 'arraybuffer';
 
     ws.onopen =
         function (event)
         {
             console.log(`Connected to WebSocket server at ${connectionString}`);
+
+            isConnecting = false;
 
             clearTimeout(scheduledReconnect);
             scheduledReconnect = undefined;
@@ -415,7 +495,16 @@ function connect()
                 }
 
                 reset();
-                vis.reset();
+                if (message.reset_visualiser !== false && !message.is_paused)
+                    vis.reset();
+            }
+            else if (message.status == 'timing')
+            {
+                if (framesPerSecond != message.frames_per_second)
+                {
+                    console.log('Frames per second set to ' + message.frames_per_second + 'Hz');
+                    setFramesPerSecond(message.frames_per_second);
+                }
             }
             else if (message.status == 'attributes_reset')
             {
@@ -439,6 +528,7 @@ function connect()
         function ()
         {
             console.log('WebSocket connection closed');
+            isConnecting = false;
             cancelAnimationFrame(animationRequestId);
             animationRequestId = null;
             if (!hasBeenRemoved && document.visibilityState == 'visible')
@@ -449,19 +539,31 @@ function connect()
         function (error)
         {
             console.log('WebSocket error, closing and scheduling reconnect');
+            isConnecting = false;
             ws.close();
 
             if (document.visibilityState == 'visible')
                 scheduleReconnect();
         };
+    }).catch(error =>
+    {
+        console.log('Failed to connect to WebSocket server:', error);
+        isConnecting = false;
+
+        if (document.visibilityState == 'visible')
+            scheduleReconnect();
+    });
 }
 
 function disconnect() {
+    connectionAttempt++;
+    isConnecting = false;
+
     if (ws) {
         ws.close();
         ws = undefined;
     }
-    clearInterval(scheduledReconnect);
+    clearTimeout(scheduledReconnect);
     scheduledReconnect = undefined;
 }
 

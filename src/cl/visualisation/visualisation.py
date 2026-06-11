@@ -3,13 +3,14 @@ import os
 import uuid
 from pathlib import Path
 
-from cl.util import in_vscode
+from ..util import in_vscode
 
 def _generate_iframe(
-    unique_id    : str,
+    unique_id     : str,
     *,
     iframe_content: str | None = None,
     iframe_src    : str | None = None,
+    sandbox       : str | None = None,
 ):
     if iframe_content is not None and iframe_src is not None:
         raise ValueError("Only one of iframe_content or iframe_src should be provided.")
@@ -25,13 +26,23 @@ def _generate_iframe(
             ssh_connection = os.environ['SSH_CONNECTION']
             device_ip      = ssh_connection.split(' ')[2]
 
-        iframe_src = f"http://{device_ip}/{iframe_src.lstrip('/')}"
+        port_str = ''
+        try:
+            from ..neurons import Neurons
+            port = Neurons._get_http_port()
+            if port:
+                port_str = f':{port}'
+        except Exception:
+            pass
+
+        iframe_src = f"http://{device_ip}{port_str}/{iframe_src.lstrip('/')}"
 
     return f"""
 <iframe
     id="iframe-{unique_id}"
     {f'srcdoc="{iframe_content}"' if iframe_content is not None else ""}
     {f'src="{iframe_src}"' if iframe_src is not None else ""}
+    {f'sandbox="{sandbox}"' if sandbox is not None else ""}
     style="width: 100%; border: none; display: block;"
     scrolling="no"
 ></iframe>
@@ -118,17 +129,28 @@ window.addEventListener('message', function(event) {{
 
         scrollTarget.scrollBy({{ left: deltaX, top: deltaY }});
     }}
+    if (event.data && event.data.type === 'escape' && event.data.id === '{unique_id}') {{
+        // Deactivate the layout handler wrapper when Escape is pressed inside a
+        // sandboxed iframe (where direct cross-frame keydown listeners are blocked)
+        const iframe = document.getElementById('iframe-{unique_id}');
+        if (iframe) {{
+            const wrapper = iframe.closest('.cl-visualiser-wrapper');
+            if (wrapper && typeof layoutHandler !== 'undefined') {{
+                layoutHandler.deactivateWrapper(wrapper);
+            }}
+        }}
+    }}
 }});
 """
 
 def _generate_wrapper_script(
-    unique_id: str,
-    use_sidebar: bool,
+    unique_id   : str,
+    use_sidebar : bool,
     aspect_ratio: float | None
 ) -> str:
     """Generate the wrapper script that handles layout and event forwarding."""
     script_dir            = Path(__file__).parent
-    layout_handler        = Path(script_dir / 'layout_handler.mjs').read_text(encoding='utf-8') if use_sidebar and not in_vscode() else ""
+    layout_handler        = Path(script_dir / 'layout_handler.mjs').read_text(encoding='utf-8') if use_sidebar else ""
     aspect_ratio_observer = _generate_aspect_ratio_observer(unique_id, aspect_ratio) if (aspect_ratio is not None) else ""
 
     return f"""
@@ -193,10 +215,22 @@ def create_visualiser(
     # copy of this code on the page, one that works when the page
     # is saved and then reloaded.
     #
+    import cl
 
-    script_dir     = Path(__file__).parent
-    msgpack_source = Path(script_dir / 'web' / 'msgpack-lite-numpy.js').read_text(encoding='utf-8')
-    engine         = Path(script_dir / 'web' / 'engine.mjs').read_text(encoding='utf-8')
+    running_on_device = not cl.is_simulator()
+
+    script_dir = Path(__file__).parent
+
+    # Only read the SDK's bundled JS when NOT on device. On device, the web server
+    # serves its own versions of these files which are designed for that context.
+    msgpack_source = None
+    engine         = None
+    if not running_on_device:
+        from cl import Neurons
+        msgpack_source = Path(script_dir / 'web' / 'msgpack-lite-numpy.js').read_text(encoding='utf-8')
+        engine         = Path(script_dir / 'web' / 'engine.mjs').read_text(encoding='utf-8')
+        neurons = Neurons._get_instance()
+        neurons._start_simulator_services()
 
     # Load the visualiser code.
     mjs = Path(javascript_file).read_text(encoding='utf-8')
@@ -208,14 +242,29 @@ def create_visualiser(
     ssh_ip = None
     if in_vscode() and 'SSH_CONNECTION' in os.environ:
         ssh_connection = os.environ['SSH_CONNECTION']
-        ssh_ip = ssh_connection.split(" ")[2]
+        ssh_ip         = ssh_connection.split(" ")[2]
 
-    ws_port = os.environ.get("CL_SDK_WEBSOCKET_PORT", "1025")
+    # Get the HTTP server URL so the inline engine can fetch /_/config
+    config_base_url = None
+    try:
+        from cl.neurons import Neurons
+        http_port = Neurons._get_http_port()
+        if http_port:
+            config_base_url = f"http://{ssh_ip or 'localhost'}:{http_port}"
+    except Exception:
+        pass
 
-    iframe_content = f"""
+    # On device, include the dashboard stylesheet from the device's web server
+    device_stylesheet = ''
+    if running_on_device:
+        stylesheet_host   = f"http://{ssh_ip}" if ssh_ip else ""
+        device_stylesheet = f'<link rel="stylesheet" href="{stylesheet_host}/css/dashboard/style.css">'
+
+    _page_head = f"""
 <!DOCTYPE html>
 <html>
 <head>
+    {device_stylesheet}
     <style>
         html, body {{
             margin: 0;
@@ -241,16 +290,14 @@ def create_visualiser(
 <body>
     <div id="{unique_id}">
         {html}
-    </div>
-    <script type="module">
-        {msgpack_source}
-        const uniqueId = '{unique_id}';
-        const dataStreams = {json.dumps(data_streams or [])};
-        const sshIp = {json.dumps(ssh_ip)};
-        const websocketPort = {ws_port};
-        {mjs}
-        {engine}
+    </div>"""
 
+    _page_tail = """
+</body>
+</html>
+"""
+
+    _resize_scroll_handlers = f"""
         // Notify parent of size changes for dynamic iframe height
         function notifyParentOfSize() {{
             const height = document.body.scrollHeight;
@@ -273,15 +320,62 @@ def create_visualiser(
                 deltaX: e.deltaX,
                 deltaMode: e.deltaMode
             }}, '*');
-            // Don't preventDefault - let the event bubble naturally
-            // The parent will handle scrolling its container
         }}, {{ passive: true }});
+
+        // Forward Escape key to parent for layout handler deactivation
+        // (direct cross-frame keydown listeners are unavailable in sandboxed iframes)
+        window.addEventListener('keydown', (e) => {{
+            if (e.key === 'Escape') {{
+                window.parent.postMessage({{ type: 'escape', id: '{unique_id}' }}, '*');
+            }}
+        }});"""
+
+    if running_on_device:
+        # On device: load msgpack and engine from the web server's served endpoints.
+        # vis.mjs is loaded as a classic (non-module) script so its declarations
+        # (function createVisualiser, const dataStreams, ...) are visible to engine.mjs.
+        # Each classic script tag shares the same global environment, so engine.mjs
+        # can read uniqueId and createVisualiser defined in the preceding script tags.
+        iframe_content = f"""{_page_head}
+    <script src="/js/msgpack-lite-numpy.js"></script>
+    <script>
+        const uniqueId = '{unique_id}';
+        const dataStreams = {json.dumps(data_streams or [])};
+        const sshIp = {json.dumps(ssh_ip)};
+
+        // Provide hostname and WebSocket protocol for the sandboxed iframe,
+        // since location.hostname is unavailable with an opaque origin.
+        // document.baseURI is inherited from the parent document regardless of sandbox.
+        const _baseUrl = new URL(document.baseURI);
+        const deviceHostname   = _baseUrl.hostname || 'localhost';
+        const deviceWsProtocol = _baseUrl.protocol === 'https:' ? 'wss' : 'ws';
     </script>
-</body>
-</html>
-"""
+    <script>
+        {mjs}
+    </script>
+    <script src="/js/engine.mjs"></script>
+    <script>
+        {_resize_scroll_handlers}
+    </script>
+{_page_tail}"""
+    else:
+        # Off device: inline everything into a single module script so the SDK's
+        # engine variant (with Jupyter/VSCode-specific adaptations) is used.
+        iframe_content = f"""{_page_head}
+    <script type="module">
+        {msgpack_source}
+        const uniqueId = '{unique_id}';
+        const dataStreams = {json.dumps(data_streams or [])};
+        const sshIp = {json.dumps(ssh_ip)};
+        const configBaseUrl = {json.dumps(config_base_url)};
+        {mjs}
+        {engine}
+
+        {_resize_scroll_handlers}
+    </script>
+{_page_tail}"""
 
     return f"""
-{_generate_iframe(unique_id, iframe_content=iframe_content)}
+{_generate_iframe(unique_id, iframe_content=iframe_content, sandbox='allow-scripts' if running_on_device else None)}
 {_generate_wrapper_script(unique_id, use_sidebar, aspect_ratio)}
 """

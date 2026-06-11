@@ -4,7 +4,7 @@
 {% extends "frame.html.jinja2" %}
 {% block head %}
     {{ super() }}
-    <script src="/doc-handler.js"></script>
+    <script src="{{ base_url }}/doc-handler.js"></script>
 {% endblock %}
 {% block title %}CL API Reference: {{ module.modulename }}{% endblock %}
 {% block nav %}
@@ -61,7 +61,7 @@
     {% macro render_modules(tree, prefix="", depth=0) %}
         {% for name, subtree in tree.items() %}
             {% set full_name = (prefix + "." + name) if prefix else name %}
-            {% set url = "/" + "/".join(full_name.split(".")) + ".html" %}
+            {% set url = base_url + "/" + "/".join(full_name.split(".")) + ".html" %}
             <li style="padding-left: {{ depth * 1.5 }}em">
                 {% if full_name == module.modulename %}
                     <strong>{{ full_name }}</strong>

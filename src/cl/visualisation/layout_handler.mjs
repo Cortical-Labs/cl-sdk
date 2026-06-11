@@ -255,12 +255,12 @@ class LayoutHandler {
         //         <span>Visualisation Sidebar</span>
         //     </div>
         // `;
-        
+
         // Create the div container for visualiser wrappers
         const panelDiv = document.createElement('div');
         panelDiv.id = LayoutHandler.PANEL_DIV_ID;
         panel.appendChild(panelDiv);
-        
+
         container.appendChild(panel);
 
         // Transfer scroll position to the new scroll container (.cl-notebook-area)
@@ -337,12 +337,12 @@ class LayoutHandler {
                 <span>Visualisations</span>
             </div>
         `;
-        
+
         // Create the div container for visualiser wrappers
         const panelDiv = document.createElement('div');
         panelDiv.id = LayoutHandler.PANEL_DIV_ID;
         panel.appendChild(panelDiv);
-        
+
         container.appendChild(panel);
 
         // Transfer scroll position to the new scroll container (.cl-notebook-area)
@@ -365,7 +365,7 @@ class LayoutHandler {
                     iframe.contentWindow.document.removeEventListener('keydown', wrapper._iframeKeyHandler, true);
                     wrapper._iframeKeyHandler = null;
                 } catch (e) {
-                    console.debug('[CL Layout] Could not remove iframe key listener:', e);
+                    // Expected for sandboxed iframes
                 }
             }
 
@@ -382,8 +382,7 @@ class LayoutHandler {
                     iframe.contentWindow.document.dispatchEvent(mouseEvent);
                 }
             } catch (e) {
-                // Ignore if cross-origin or other issues
-                console.debug('[CL Layout] Could not dispatch cleanup mousemove event:', e);
+                // Expected for sandboxed iframes
             }
 
             iframe.style.pointerEvents = 'none';
@@ -421,7 +420,7 @@ class LayoutHandler {
                     iframe.contentWindow.document.addEventListener('keydown', iframeKeyHandler, true);
                 }
             } catch (e) {
-                console.debug('[CL Layout] Could not add iframe key listener:', e);
+                // Expected for sandboxed iframes
             }
         }
         wrapper.classList.add('cl-interactive');

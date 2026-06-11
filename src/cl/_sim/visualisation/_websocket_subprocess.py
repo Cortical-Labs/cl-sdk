@@ -12,30 +12,30 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import inspect
 import json
 import logging
-import multiprocessing
 import os
+import queue
 import signal
 import socket
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Final, override
 from urllib.parse import urlparse
 
 import numpy as np
 import websockets as ws
 
-from .. import Spike, Stim
+from ... import Spike, Stim
 from .._data_buffer import DataStreamEventRecord, SharedDataBuffer
 from .._data_producer import STALE_THRESHOLD_NS
-from ._http_server import StaticHttpServer
+from .._subprocess import IpcProcess, StdoutStatusWriter, read_ipc_message, start_ipc_command_reader
+from ._http_server import StaticHttpServer, find_available_port, BASE_HOST, BASE_WS_PORT
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from multiprocessing import Queue
-    from multiprocessing.process import BaseProcess
+    from collections.abc import Awaitable, Callable
 
 class WebSocketHandshakeFilter(logging.Filter):
     """Filter to suppress cosmetic handshake errors when clients probe before server is ready."""
@@ -71,9 +71,18 @@ ANALYSIS_SIZE_MS = 5
 FLAG_HAS_SPIKE   = 1 << 0
 FLAG_HAS_STIM    = 1 << 1
 
+class _NumpySerialisableEncodeer(json.JSONEncoder):
+    """Handles numpy type conversion when encoding JSON."""
+    def default(self, o):
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        if isinstance(o, (np.integer, np.floating, np.bool_)):
+            return o.item()
+        return super().default(o)
+
 def _to_json(obj: dict) -> str:
     """Serialize dict to compact JSON string."""
-    return json.dumps(obj, separators=(',', ':'))
+    return json.dumps(obj, cls=_NumpySerialisableEncodeer, separators=(',', ':'))
 
 def _make_status(status: str, data: dict | None = None) -> str:
     """Create a status message matching the system protocol."""
@@ -82,13 +91,17 @@ def _make_status(status: str, data: dict | None = None) -> str:
         message.update(data)
     return _to_json(message)
 
-def _run_websocket_subprocess(config: SubprocessConfig, ready_queue: Queue, command_queue: Queue) -> None:
+def _run_websocket_subprocess(
+    config       : SubprocessConfig,
+    ready_queue  : StdoutStatusWriter,
+    command_queue: queue.Queue[AttributeUpdateCommand | AttributeResetCommand],
+) -> None:
     """
     Entry point for WebSocket subprocess.
 
     Args:
-        config: Subprocess configuration
-        ready_queue: Queue to signal when server is ready
+        config       : Subprocess configuration
+        ready_queue  : Queue to signal when server is ready
         command_queue: Queue for receiving commands from main process
     """
 
@@ -100,10 +113,14 @@ def _run_websocket_subprocess(config: SubprocessConfig, ready_queue: Queue, comm
         with contextlib.suppress(OSError, AttributeError):
             os.nice(10)
 
-        _logger.info("WebSocket subprocess starting, connecting to buffer: %s", config.buffer_name)
+        _logger.info("Visualisation service starting, connecting to buffer: %s", config.buffer_name)
 
         # Connect to existing shared memory buffer
-        buffer = SharedDataBuffer.attach(as_producer=False, name_prefix=config.buffer_name)
+        buffer = SharedDataBuffer.attach(
+            as_producer                      = False,
+            name_prefix                      = config.buffer_name,
+            unregister_from_resource_tracker = True,
+        )
         _logger.info("Connected to shared buffer")
 
         # Create lightweight reader
@@ -127,11 +144,11 @@ def _run_websocket_subprocess(config: SubprocessConfig, ready_queue: Queue, comm
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        _logger.exception("WebSocket subprocess error: %s", e)
+        _logger.exception("Visualisation service error: %s", e)
         with contextlib.suppress(Exception):
             ready_queue.put({"status": "error", "error": f"{e}\n{tb}"})
     finally:
-        _logger.info("WebSocket subprocess shutting down")
+        _logger.info("Visualisation service shutting down")
 
 @dataclass
 class SubprocessConfig:
@@ -139,8 +156,8 @@ class SubprocessConfig:
     buffer_name      : str
     frames_per_second: int
     channel_count    : int
-    port             : int        = 1025
-    host             : str        = "127.0.0.1"
+    port             : int
+    host             : str        = BASE_HOST
     serve_vis        : bool       = True
     web_directory    : str | None = None
     app_html         : str | None = None
@@ -156,6 +173,38 @@ class AttributeResetCommand:
     """Command to reset data stream attributes."""
     stream_name: str
     attributes : dict
+
+def websocket_command_to_message(cmd: AttributeUpdateCommand | AttributeResetCommand) -> dict[str, Any]:
+    """Convert a WebSocket command into an IPC message."""
+    if isinstance(cmd, AttributeUpdateCommand):
+        return {
+            "type"              : "attribute_update",
+            "stream_name"       : cmd.stream_name,
+            "updated_attributes": cmd.updated_attributes,
+        }
+    if isinstance(cmd, AttributeResetCommand):
+        return {
+            "type"       : "attribute_reset",
+            "stream_name": cmd.stream_name,
+            "attributes" : cmd.attributes,
+        }
+    raise TypeError(f"Unsupported WebSocket command: {type(cmd).__name__}")
+
+
+def websocket_command_from_message(message: dict[str, Any]) -> AttributeUpdateCommand | AttributeResetCommand:
+    """Convert a decoded IPC message into a WebSocket command."""
+    match message.get("type"):
+        case "attribute_update":
+            return AttributeUpdateCommand(
+                stream_name        = message["stream_name"],
+                updated_attributes = message["updated_attributes"],
+            )
+        case "attribute_reset":
+            return AttributeResetCommand(
+                stream_name = message["stream_name"],
+                attributes  = message["attributes"],
+            )
+    raise ValueError(f"Unknown WebSocket command type: {message.get('type')!r}")
 
 @dataclass(eq=False)
 class ClientSession:
@@ -259,9 +308,27 @@ class BufferReader:
         # Convert StimRecords to Stim objects for compatibility
         return [Stim(timestamp=s.timestamp, channel=s.channel) for s in stim_records]
 
+    @property
+    def stim_write_timestamp(self) -> int:
+        """Timestamp up to which the main process has written stims."""
+        return self._buffer.stim_write_timestamp
+
     def read_datastream_events(self, from_timestamp: int, to_timestamp: int) -> list[DataStreamEventRecord]:
         """Read datastream events from buffer."""
         return self._buffer.read_datastream_events(from_timestamp, to_timestamp)
+
+    def get_playback_speed(self) -> float:
+        """Get the current playback speed from the buffer."""
+        return self._buffer.playback_speed
+
+    def get_is_paused(self) -> bool:
+        """Get whether playback is currently paused."""
+        return self._buffer.pause_flag
+
+    @property
+    def requested_timestamp(self) -> int:
+        """Get the requested timestamp used by accelerated-time producers."""
+        return self._buffer.requested_timestamp
 
 class OverviewProtocol:
     """Protocol for the /_/ws/overview WebSocket endpoint."""
@@ -270,23 +337,27 @@ class OverviewProtocol:
     STATUS: Final = "status"
 
     @staticmethod
-    def make_reset(analysis_ms: int, channel_mean: list[float], channel_stddev: list[float]) -> str:
+    def make_reset(analysis_ms: int, channel_mean: list[float], channel_stddev: list[float], playback_speed: float = 1.0, is_paused: bool = False) -> str:
         return _make_status(
             OverviewProtocol.RESET,
             {
                 "analysisMs"    : analysis_ms,
                 "channel_mean"  : channel_mean,
                 "channel_stddev": channel_stddev,
+                "playback_speed": playback_speed,
+                "is_paused"     : is_paused,
             }
         )
 
     @staticmethod
-    def make_status(channel_mean: list[float], channel_stddev: list[float]) -> str:
+    def make_status(channel_mean: list[float], channel_stddev: list[float], playback_speed: float = 1.0, is_paused: bool = False) -> str:
         return _make_status(
             OverviewProtocol.STATUS,
             {
                 "channel_mean"  : channel_mean,
                 "channel_stddev": channel_stddev,
+                "playback_speed": playback_speed,
+                "is_paused"     : is_paused,
             }
         )
 
@@ -299,15 +370,35 @@ class LiveStreamingProtocol:
     NEW_DATA          : Final = "new_data"
     CL_SPIKES         : Final = "cl_spikes"
     CL_STIMS          : Final = "cl_stims"
+    TIMING            : Final = "timing"
     ATTRIBUTES_RESET  : Final = "attributes_reset"
     ATTRIBUTES_UPDATED: Final = "attributes_updated"
     SAMPLES_PER_SPIKE : Final = 75
 
     @staticmethod
-    def make_reset(frames_per_second: int) -> str:
+    def make_reset(
+        frames_per_second: int,
+        *,
+        reset_visualiser: bool = True,
+        is_paused       : bool = False,
+    ) -> str:
         return _make_status(
             LiveStreamingProtocol.RESET,
-            {"frames_per_second": frames_per_second}
+            {
+                "frames_per_second": frames_per_second,
+                "reset_visualiser" : reset_visualiser,
+                "is_paused"        : is_paused,
+            }
+        )
+
+    @staticmethod
+    def make_timing(frames_per_second: int, *, is_paused: bool = False) -> str:
+        return _make_status(
+            LiveStreamingProtocol.TIMING,
+            {
+                "frames_per_second": frames_per_second,
+                "is_paused"        : is_paused,
+            }
         )
 
     @staticmethod
@@ -439,13 +530,13 @@ class SubprocessWebSocketServer:
     def __init__(
         self,
         reader       : BufferReader,
-        port         : int                                                          = 1025,
-        host         : str                                                          = "127.0.0.1",
-        serve_vis    : bool                                                         = True,
-        web_directory: str | None                                                   = None,
-        ready_queue  : Queue[dict[str, Any]] | None                                 = None,
-        command_queue: Queue[AttributeUpdateCommand | AttributeResetCommand] | None = None,
-        app_html     : str | None                                                   = None,
+        port         : int,
+        host         : str                                                                = BASE_HOST,
+        serve_vis    : bool                                                               = True,
+        web_directory: str                                                         | None = None,
+        ready_queue  : StdoutStatusWriter                                          | None = None,
+        command_queue: queue.Queue[AttributeUpdateCommand | AttributeResetCommand] | None = None,
+        app_html     : str                                                         | None = None,
     ):
         self._reader        = reader
         self._port          = port
@@ -462,9 +553,6 @@ class SubprocessWebSocketServer:
         # Use an OrderedDict for LRU-style cleanup (oldest entries removed first)
         self._data_stream_attributes: OrderedDict[str, dict] = OrderedDict()
         self._max_data_stream_attributes = 1000  # Limit to prevent unbounded growth
-
-        # Track pending broadcast task to prevent accumulation
-        self._pending_broadcast_task: asyncio.Task | None = None
 
         # Start web server if enabled
         if serve_vis:
@@ -519,6 +607,8 @@ class SubprocessWebSocketServer:
             self._reader,
             self._on_new_frames,
             self._on_seek_detected,
+            self._on_new_second,
+            self._on_timing_changed,
         )
 
         # Server options
@@ -651,14 +741,13 @@ class SubprocessWebSocketServer:
         # Get the data stream from neurons (need to access via shared state or queue)
         # For now, we'll need to track data stream attributes in the subprocess
         # This will be populated via a command when attributes are set
-        if hasattr(self, '_data_stream_attributes'):
-            attributes = self._data_stream_attributes.get(stream_name)
-            if attributes:
-                message = LiveStreamingProtocol.make_attributes_reset(stream_name, attributes)
-                try:
-                    await client.send_text(message)
-                except Exception as e:
-                    _logger.debug("Failed to send initial attributes for %s: %s", stream_name, e)
+        attributes = self._data_stream_attributes.get(stream_name)
+        if attributes:
+            message = LiveStreamingProtocol.make_attributes_reset(stream_name, attributes)
+            try:
+                await client.send_text(message)
+            except Exception as e:
+                _logger.debug("Failed to send initial attributes for %s: %s", stream_name, e)
 
     async def _handle_connection(self, websocket: ws.ServerConnection) -> None:
         """Handle incoming WebSocket connection."""
@@ -696,7 +785,9 @@ class SubprocessWebSocketServer:
             reset_msg = OverviewProtocol.make_reset(
                 ANALYSIS_SIZE_MS,
                 channel_mean,
-                channel_stddev
+                channel_stddev,
+                playback_speed = self._reader.get_playback_speed(),
+                is_paused      = self._reader.get_is_paused(),
             )
             await client.send_text(reset_msg)
 
@@ -716,13 +807,17 @@ class SubprocessWebSocketServer:
                             OverviewProtocol.make_reset(
                                 ANALYSIS_SIZE_MS,
                                 channel_mean,
-                                channel_stddev
+                                channel_stddev,
+                                playback_speed = self._reader.get_playback_speed(),
+                                is_paused      = self._reader.get_is_paused(),
                             )
                         )
 
                 except json.JSONDecodeError:
                     pass
 
+        except ws.ConnectionClosed as e:
+            _logger.debug("Overview client disconnected: %s", e)
         except Exception as e:
             _logger.warning("Overview client error: %s", e, exc_info=True)
         finally:
@@ -735,8 +830,13 @@ class SubprocessWebSocketServer:
         self._live_streaming_clients.add(client)
 
         try:
-            # Send reset message
-            reset_msg = LiveStreamingProtocol.make_reset(self._reader.get_frames_per_second())
+            # Send reset message (scale fps by speed so frontend renders at correct rate)
+            effective_fps = self._live_reader.effective_frames_per_second
+            reset_msg = LiveStreamingProtocol.make_reset(
+                effective_fps,
+                reset_visualiser = False,
+                is_paused        = self._reader.get_is_paused(),
+            )
             await client.send_text(reset_msg)
 
             # Handle messages
@@ -757,12 +857,14 @@ class SubprocessWebSocketServer:
                 except json.JSONDecodeError:
                     pass
 
+        except ws.ConnectionClosed as e:
+            _logger.debug("Live streaming client disconnected: %s", e)
         except Exception as e:
             _logger.warning("Live streaming client error: %s", e, exc_info=True)
         finally:
             self._live_streaming_clients.discard(client)
 
-    def _on_new_frames(
+    async def _on_new_frames(
         self,
         frames_ts        : int,
         frames           : np.ndarray,
@@ -771,28 +873,9 @@ class SubprocessWebSocketServer:
         datastream_events: list[DataStreamEventRecord]
     ) -> None:
         """Called by live reader when new frames are available."""
+        await self._broadcast_frames(frames_ts, frames, spikes, stims, datastream_events)
 
-        # Get the running event loop
-        try:
-            _ = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-
-        # Cancel any pending broadcast task to prevent task accumulation.
-        # This ensures only one broadcast is in-flight at a time, providing
-        # natural backpressure when broadcasts take longer than the interval.
-        if self._pending_broadcast_task is not None and not self._pending_broadcast_task.done():
-            self._pending_broadcast_task.cancel()
-
-        # Schedule new broadcast
-        self._pending_broadcast_task = asyncio.create_task(
-            self._broadcast_frames(frames_ts, frames, spikes, stims, datastream_events)
-        )
-        self._pending_broadcast_task.add_done_callback(
-            lambda t: t.exception() if not t.cancelled() else None
-        )
-
-    def _on_seek_detected(self) -> None:
+    def _on_seek_detected(self, reset_visualiser: bool = True) -> None:
         """Called by live reader when a seek/jump is detected."""
 
         # Get the running event loop
@@ -802,10 +885,51 @@ class SubprocessWebSocketServer:
             return
 
         # Schedule reset broadcast (fire-and-forget with done callback to suppress exceptions)
-        task = asyncio.ensure_future(self._broadcast_seek_reset(), loop=loop)
+        task = asyncio.ensure_future(
+            self._broadcast_seek_reset(reset_visualiser=reset_visualiser),
+            loop=loop,
+        )
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
-    async def _broadcast_seek_reset(self) -> None:
+    def _on_new_second(self) -> None:
+        """Called by live reader when one second (25000 frames) of new data has been accumulated."""
+
+        # Get the running event loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        # Schedule status broadcast (fire-and-forget with done callback to suppress exceptions)
+        task = asyncio.ensure_future(self._broadcast_status_update(), loop=loop)
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+    def _on_timing_changed(self, frames_per_second: int, is_paused: bool) -> None:
+        """Called by live reader when visual playback timing changes."""
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        task = asyncio.ensure_future(
+            self._broadcast_live_timing(frames_per_second, is_paused),
+            loop = loop,
+        )
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+    async def _broadcast_live_timing(self, frames_per_second: int, is_paused: bool) -> None:
+        """Broadcast live-stream timing without clearing visualisation state."""
+
+        timing_msg = LiveStreamingProtocol.make_timing(
+            frames_per_second,
+            is_paused = is_paused,
+        )
+        for client in list(self._live_streaming_clients):
+            with contextlib.suppress(Exception):
+                await client.send_text(timing_msg)
+
+    async def _broadcast_seek_reset(self, reset_visualiser: bool = True) -> None:
         """Broadcast reset messages to all clients after a seek."""
         _logger.debug("Broadcasting seek reset to clients")
 
@@ -813,13 +937,20 @@ class SubprocessWebSocketServer:
         channel_mean, channel_stddev = self._live_reader.get_channel_stats()
 
         # Send reset to overview clients
-        reset_msg = OverviewProtocol.make_reset(ANALYSIS_SIZE_MS, channel_mean, channel_stddev)
+        speed     = self._reader.get_playback_speed()
+        is_paused = self._reader.get_is_paused()
+        reset_msg = OverviewProtocol.make_reset(ANALYSIS_SIZE_MS, channel_mean, channel_stddev, playback_speed=speed, is_paused=is_paused)
         for client in list(self._overview_clients):
             with contextlib.suppress(Exception):
                 await client.send_text(reset_msg)
 
-        # Send reset to live streaming clients
-        live_reset_msg = LiveStreamingProtocol.make_reset(self._reader.get_frames_per_second())
+        # Send reset to live streaming clients (scale fps by speed so frontend renders at correct rate)
+        effective_fps  = self._live_reader.effective_frames_per_second
+        live_reset_msg = LiveStreamingProtocol.make_reset(
+            effective_fps,
+            reset_visualiser = reset_visualiser,
+            is_paused        = is_paused,
+        )
         for client in list(self._live_streaming_clients):
             with contextlib.suppress(Exception):
                 await client.send_text(live_reset_msg)
@@ -831,6 +962,24 @@ class SubprocessWebSocketServer:
                 if stream_name in client.subscribed_data_streams:
                     with contextlib.suppress(Exception):
                         await client.send_text(message)
+
+    async def _broadcast_status_update(self) -> None:
+        """Broadcast status update with channel means and stddevs to overview clients."""
+        _logger.debug("Broadcasting status update to overview clients")
+
+        # Get updated channel stats
+        channel_mean, channel_stddev = self._live_reader.get_channel_stats()
+
+        # Send status message to overview clients only
+        status_msg = OverviewProtocol.make_status(
+            channel_mean,
+            channel_stddev,
+            playback_speed = self._reader.get_playback_speed(),
+            is_paused      = self._reader.get_is_paused(),
+        )
+        for client in list(self._overview_clients):
+            with contextlib.suppress(Exception):
+                await client.send_text(status_msg)
 
     async def _broadcast_frames(
         self,
@@ -873,16 +1022,20 @@ class SubprocessWebSocketServer:
         payload = np.empty((chunk_count, channel_count, 3), dtype=np.int16)
 
         chunk_frames_offset = 0
-        chunk_end_ts        = frames_ts + analysis_size_frames
+        chunk_start_ts      = frames_ts
         spike_offset        = 0
         stim_offset         = 0
 
         for i in range(chunk_count):
             chunk_frames = frames[chunk_frames_offset:chunk_frames_offset + analysis_size_frames]
+            chunk_end_ts = chunk_start_ts + analysis_size_frames
 
             min_values = np.min(chunk_frames, axis=0)
             max_values = np.max(chunk_frames, axis=0)
             flags      = np.zeros(channel_count, dtype=np.int16)
+
+            while spike_offset < len(spikes) and spikes[spike_offset].timestamp < chunk_start_ts:
+                spike_offset += 1
 
             while spike_offset < len(spikes):
                 spike = spikes[spike_offset]
@@ -890,6 +1043,9 @@ class SubprocessWebSocketServer:
                     break
                 flags[spike.channel] |= FLAG_HAS_SPIKE
                 spike_offset += 1
+
+            while stim_offset < len(stims) and stims[stim_offset].timestamp < chunk_start_ts:
+                stim_offset += 1
 
             while stim_offset < len(stims):
                 stim = stims[stim_offset]
@@ -901,7 +1057,7 @@ class SubprocessWebSocketServer:
             payload[i] = np.column_stack((min_values, max_values, flags))
 
             chunk_frames_offset += analysis_size_frames
-            chunk_end_ts        += analysis_size_frames
+            chunk_start_ts       = chunk_end_ts
 
         # Send to clients
         binary_data  = payload.tobytes()
@@ -981,6 +1137,9 @@ class SubprocessLiveReader:
 
     BROADCAST_INTERVAL_MS         = 50  # Broadcast every 50ms (20 Hz)
     BURST_MS                      = 50  # How much data to read per broadcast (match interval to avoid gaps/overlaps)
+    VISUAL_SPEED_EWMA_ALPHA       = 0.25
+    TIMING_CHANGE_RATIO           = 0.05
+    TIMING_UPDATE_INTERVAL_NS     = 250_000_000
     CAPTURED_SPIKE_SAMPLES_BEFORE = 25
     CAPTURED_SPIKE_SAMPLES_AFTER  = 49
     CAPTURED_SPIKE_SAMPLES        = CAPTURED_SPIKE_SAMPLES_BEFORE + 1 + CAPTURED_SPIKE_SAMPLES_AFTER
@@ -988,17 +1147,23 @@ class SubprocessLiveReader:
     def __init__(
         self,
         reader          : BufferReader,
-        on_new_frames   : Callable[[int, np.ndarray, list[Spike], list[Stim], list[DataStreamEventRecord]], None],
-        on_seek_detected: Callable[[], None] | None = None,
+        on_new_frames   : Callable[[int, np.ndarray, list[Spike], list[Stim], list[DataStreamEventRecord]], Awaitable[None] | None],
+        on_seek_detected: Callable[[bool], None] | None = None,
+        on_new_second   : Callable[[], None] | None = None,
+        on_timing_changed: Callable[[int, bool], None] | None = None,
     ):
         self._reader                   = reader
         self._on_new_frames            = on_new_frames
         self._on_seek_detected         = on_seek_detected
+        self._on_new_second            = on_new_second
+        self._on_timing_changed        = on_timing_changed
         self._frames_per_second        = reader.get_frames_per_second()
         self._channel_count            = reader.get_channel_count()
         self._read_size_frames         = int(self._frames_per_second * self.BURST_MS / 1000)
         self._running                  = False
         self._next_read_ts: int | None = None
+        self._stim_read_ts: int | None = None   # Stim cursor aligned to broadcast windows
+        self._frames_since_status      = 0  # Track frames since last second boundary
 
         # Running stats
         self._channel_sum      = np.zeros(self._channel_count, dtype=np.float64)
@@ -1007,14 +1172,42 @@ class SubprocessLiveReader:
         self._spikes_broadcast = 0
         self._zero_spike_reads = 0
 
+        # Track playback speed for change detection
+        self._last_speed  = 1.0
+        self._last_paused = False
+
+        # Visual playback timing.  In playback mode the producer tells us the
+        # rate directly.  In accelerated simulation mode, the producer advances
+        # to requested timestamps as fast as the Python code asks for them, so
+        # infer and smooth a render rate from observed timestamp movement.
+        self._visual_speed                          = 1.0
+        self._accelerated_visual_active             = False
+        self._last_speed_sample_ts:      int | None = None
+        self._last_speed_sample_time_ns: int | None = None
+        self._last_announced_fps                    = self._frames_per_second
+        self._last_timing_update_ns                 = 0
+
+        # First sample as fallback reference (used when no data accumulated yet)
+        self._first_sample: np.ndarray | None = None
+
+    @property
+    def effective_frames_per_second(self) -> int:
+        return max(1, int(round(self._frames_per_second * self._visual_speed)))
+
     def reset_stats(self) -> None:
         """Reset running channel statistics."""
-        self._channel_sum    = np.zeros(self._channel_count, dtype=np.float64)
-        self._channel_sum_sq = np.zeros(self._channel_count, dtype=np.float64)
-        self._sample_count   = 0
+        self._channel_sum         = np.zeros(self._channel_count, dtype=np.float64)
+        self._channel_sum_sq      = np.zeros(self._channel_count, dtype=np.float64)
+        self._sample_count        = 0
+        self._frames_since_status = 0     # Reset status tracking on seek
+        self._first_sample        = None  # Clear first sample reference on seek
 
     def get_channel_stats(self) -> tuple[list[float], list[float]]:
         if self._sample_count == 0:
+            # No accumulated data yet - use first sample as reference point if available
+            if self._first_sample is not None:
+                return self._first_sample.tolist(), [1.0] * self._channel_count
+            # No data at all yet - return neutral values
             return [0.0] * self._channel_count, [1.0] * self._channel_count
 
         mean     = self._channel_sum / self._sample_count
@@ -1031,6 +1224,7 @@ class SubprocessLiveReader:
         now                = self._reader.timestamp()
         safety_margin      = 500  # frames
         self._next_read_ts = now - safety_margin
+        self._stim_read_ts = self._next_read_ts
 
         _logger.info("SubprocessLiveReader started, initial ts: %d", self._next_read_ts)
         broadcast_count = 0
@@ -1085,23 +1279,132 @@ class SubprocessLiveReader:
         # If heartbeat hasn't updated in 200ms, consider it stale
         return elapsed_ns > STALE_THRESHOLD_NS
 
+    def _requested_timestamp(self) -> int:
+        return getattr(self._reader, "requested_timestamp", 0)
+
+    def _update_visual_speed(self, ready_ts: int, base_speed: float, is_paused: bool) -> bool:
+        """
+        Update the render speed used by the websocket stream.
+
+        Returns True when we are in accelerated visual mode.  That mode is
+        driven by `requested_timestamp` and backlog rather than by the
+        explicit playback speed control used by cl.playback.
+        """
+        sample_time_ns = time.perf_counter_ns()
+        backlog_frames = 0
+        if self._next_read_ts is not None:
+            backlog_frames = max(0, ready_ts - self._next_read_ts)
+
+        requested_ts       = self._requested_timestamp()
+        accelerated_active = (
+            requested_ts > 0
+            or (
+                self._accelerated_visual_active
+                and backlog_frames > self._read_size_frames * 2
+            )
+        )
+        self._accelerated_visual_active = accelerated_active
+
+        if is_paused:
+            target_speed = 1.0
+        elif accelerated_active and base_speed == 1.0:
+            observed_speed = 1.0
+            if (
+                self._last_speed_sample_ts is not None
+                and self._last_speed_sample_time_ns is not None
+                and ready_ts > self._last_speed_sample_ts
+                and sample_time_ns > self._last_speed_sample_time_ns
+            ):
+                elapsed_s      = (sample_time_ns - self._last_speed_sample_time_ns) * 1e-9
+                observed_speed = (ready_ts - self._last_speed_sample_ts) / (elapsed_s * self._frames_per_second)
+
+            # If the producer has already raced ahead, choose a speed that
+            # drains the backlog over roughly one second.  This prevents
+            # accelerated loops from being misclassified as seeks.
+            backlog_speed = backlog_frames / self._frames_per_second
+            target_speed = max(1.0, observed_speed, backlog_speed)
+        else:
+            target_speed = max(0.01, base_speed)
+
+        if accelerated_active and base_speed == 1.0:
+            alpha = self.VISUAL_SPEED_EWMA_ALPHA
+            self._visual_speed = max(1.0, (self._visual_speed * (1.0 - alpha)) + (target_speed * alpha))
+        else:
+            self._visual_speed = target_speed
+
+        self._last_speed_sample_ts      = ready_ts
+        self._last_speed_sample_time_ns = sample_time_ns
+        return accelerated_active and base_speed == 1.0
+
+    def _maybe_announce_timing(self, is_paused: bool) -> None:
+        if self._on_timing_changed is None:
+            return
+
+        fps         = self.effective_frames_per_second
+        ratio_delta = abs(fps - self._last_announced_fps) / max(self._last_announced_fps, 1)
+        now_ns      = time.perf_counter_ns()
+        if (
+            ratio_delta >= self.TIMING_CHANGE_RATIO
+            and now_ns - self._last_timing_update_ns >= self.TIMING_UPDATE_INTERVAL_NS
+        ):
+            self._last_announced_fps    = fps
+            self._last_timing_update_ns = now_ns
+            self._on_timing_changed(fps, is_paused)
+
     async def _do_broadcast(self) -> None:
         """Read latest data and broadcast to clients."""
+        # Scale read size by the visual playback speed so accelerated time and
+        # playback speed changes are rendered smoothly rather than as seeks.
+        speed     = max(0.01, self._reader.get_playback_speed())
+        is_paused = self._reader.get_is_paused()
+
+        # Detect speed changes; timing updates are announced below without
+        # clearing queued frontend data.
+        if speed != self._last_speed:
+            self._last_speed = speed
+
+        # Detect pause state changes and trigger a reset so the frontend freezes/resumes
+        if is_paused != self._last_paused:
+            self._last_paused = is_paused
+            if self._on_seek_detected:
+                self._on_seek_detected(False)
+
+        # When paused, keep _next_read_ts tracking the current position so we
+        # don't accumulate lag and can resume seamlessly, then return early
+        if is_paused:
+            now = self._reader.timestamp()
+            self._next_read_ts = now - self.CAPTURED_SPIKE_SAMPLES_BEFORE - 100
+            self._stim_read_ts = self._next_read_ts
+            return
+
+        frame_write_ts = self._reader.timestamp()
+        stim_write_ts  = self._reader.stim_write_timestamp
+        buffer_start   = self._reader.start_timestamp()
+
+        # The overview protocol carries only chunk data, not per-chunk
+        # timestamps, so late stim flags cannot be corrected after the chunk
+        # has been sent.  Publish only windows whose frames, spike snippets,
+        # and stim metadata are all available up to the same end timestamp.
+        now = min(frame_write_ts - self.CAPTURED_SPIKE_SAMPLES_AFTER, stim_write_ts)
+        if now <= buffer_start:
+            return
+
+        accelerated_visual_active = self._update_visual_speed(now, speed, is_paused)
+        self._maybe_announce_timing(is_paused)
+        scaled_read_size = max(1, int(self._read_size_frames * self._visual_speed))
         extended_read_size = (
             self.CAPTURED_SPIKE_SAMPLES_BEFORE +
-            self._read_size_frames +
+            scaled_read_size +
             self.CAPTURED_SPIKE_SAMPLES_AFTER
         )
 
-        now = self._reader.timestamp()
-        buffer_start = self._reader.start_timestamp()
-
         # Track where we should read next sequentially
         # Handle various cases: initial read, falling behind, backward seeks
-        max_lag = self._read_size_frames * 4  # Allow up to 4 chunks of lag before jumping
+        max_lag = scaled_read_size * 40  # Allow up to 40 chunks of lag before jumping
         # Threshold for detecting significant backward jump (e.g., seek) vs just catching up
-        backward_jump_threshold = self._read_size_frames * 2
-        seek_detected = False
+        backward_jump_threshold = scaled_read_size * 2
+        seek_detected     = False
+        reset_visualiser  = True
 
         if self._next_read_ts is None:
             # First read - start slightly behind live
@@ -1115,21 +1418,29 @@ class SubprocessLiveReader:
         elif self._next_read_ts > now:
             # Minor drift ahead (e.g., catching up or paused) - wait for data
             return
-        elif now - self._next_read_ts > max_lag:
+        elif now - self._next_read_ts > max_lag and not accelerated_visual_active:
             # We've fallen too far behind, jump to near-live
             old_ts = self._next_read_ts
             self._next_read_ts = now - extended_read_size - 100
             _logger.debug("Jumped from %d to %d (was %d frames behind)", old_ts, self._next_read_ts, now - old_ts)
-            seek_detected = True
+            seek_detected    = True
+            reset_visualiser = False
 
         # Reset stats and notify on seek
         if seek_detected:
             self.reset_stats()
             if self._on_seek_detected:
-                self._on_seek_detected()
+                self._on_seek_detected(reset_visualiser)
+            # Reset stim cursor on seek so we don't miss stims at the new position
+            self._stim_read_ts = self._next_read_ts
 
         # Ensure we don't read before buffer start
         self._next_read_ts = max(self._next_read_ts, buffer_start + 100)
+        if self._stim_read_ts is None or self._stim_read_ts < buffer_start + 100:
+            self._stim_read_ts = max(self._next_read_ts, buffer_start + 100)
+
+        if self._next_read_ts + scaled_read_size > now:
+            return
 
         from_ts = self._next_read_ts - self.CAPTURED_SPIKE_SAMPLES_BEFORE
 
@@ -1138,11 +1449,11 @@ class SubprocessLiveReader:
         except ValueError:
             return  # Data not ready yet
 
-        this_read_ts = self._next_read_ts
-        self._next_read_ts += self._read_size_frames  # Advance for next read
+        this_read_ts        = self._next_read_ts
+        self._next_read_ts += scaled_read_size    # Advance for next read
 
-        start = self.CAPTURED_SPIKE_SAMPLES_BEFORE
-        end = start + self._read_size_frames
+        start  = self.CAPTURED_SPIKE_SAMPLES_BEFORE
+        end    = start + scaled_read_size
         frames = extended_frames[start:end]
 
         # Update stats
@@ -1150,10 +1461,31 @@ class SubprocessLiveReader:
         self._channel_sum_sq += (frames.astype(np.float64) ** 2).sum(axis=0)
         self._sample_count   += len(frames)
 
-        # Get spikes and stims
-        spikes = self._reader.read_spikes(self._read_size_frames, this_read_ts)
-        to_ts  = this_read_ts + self._read_size_frames
-        stims  = self._reader.read_stims(this_read_ts, to_ts)
+        # Capture first sample as reference point (mean of first frame) if not already captured
+        if self._first_sample is None and len(frames) > 0:
+            self._first_sample = np.mean(frames, axis=0).astype(np.float64)
+            # Force a reset message to update clients with initial stats
+            if self._on_seek_detected is not None:
+                self._on_seek_detected(False)
+
+        # Track frames for status message emission
+        self._frames_since_status += len(frames)
+        if self._frames_since_status >= self._frames_per_second and self._on_new_second:
+            self._frames_since_status %= self._frames_per_second
+            self._on_new_second()
+
+        # Get spikes and stims from the same frame window. The publishability
+        # check above guarantees the stim ring has caught up to ``to_ts``.
+        spikes = self._reader.read_spikes(scaled_read_size, this_read_ts)
+        to_ts  = this_read_ts + scaled_read_size
+        assert self._stim_read_ts is not None
+        if self._stim_read_ts < this_read_ts:
+            self._stim_read_ts = this_read_ts
+        if to_ts > self._stim_read_ts:
+            stims = self._reader.read_stims(self._stim_read_ts, to_ts)
+            self._stim_read_ts = to_ts
+        else:
+            stims = []
 
         # Get datastream events
         datastream_events = self._reader.read_datastream_events(this_read_ts, to_ts)
@@ -1172,7 +1504,6 @@ class SubprocessLiveReader:
                     samples       = transposed[spike.channel, samples_start:samples_end]
                     spike.samples = (samples.astype(np.float32) - spike.channel_mean_sample) * 0.195
 
-        # Broadcast (synchronously await to provide backpressure)
         await self._broadcast_sync(this_read_ts, frames, spikes, stims, datastream_events)
 
     async def _broadcast_sync(
@@ -1184,11 +1515,9 @@ class SubprocessLiveReader:
             datastream_events: list[DataStreamEventRecord],
         ) -> None:
         """Synchronous broadcast - waits for completion before returning."""
-        # Call the server's broadcast method directly
-        # The server should have set up an async-compatible callback
-        self._on_new_frames(frames_ts, frames, spikes, stims, datastream_events)
-        # Yield to let any scheduled tasks run
-        await asyncio.sleep(0)
+        result = self._on_new_frames(frames_ts, frames, spikes, stims, datastream_events)
+        if inspect.isawaitable(result):
+            await result
 
     def stop(self) -> None:
         self._running = False
@@ -1209,26 +1538,29 @@ class WebSocketProcessManager:
         buffer_name      : str,
         frames_per_second: int,
         channel_count    : int,
-        port             : int  = 1025,
-        host             : str  = "127.0.0.1",
-        serve_vis        : bool = True,
+        port             : int | None = None,
+        host             : str | None = None,
+        serve_vis        : bool       = True,
         app_html         : str | None = None,
     ):
+        # Find an available port if none specified
+        if host is None:
+            host = BASE_HOST
+        resolved_port = find_available_port(host, start_port=BASE_WS_PORT if port is None else port)
+
         self._config = SubprocessConfig(
             buffer_name       = buffer_name,
             frames_per_second = frames_per_second,
             channel_count     = channel_count,
-            port              = port,
+            port              = resolved_port,
             host              = host,
             serve_vis         = serve_vis,
             app_html          = app_html,
         )
-        self._process      : BaseProcess | None                                           = None
-        self._ready_queue  : Queue[dict[str, Any]] | None                                 = None
-        self._command_queue: Queue[AttributeResetCommand | AttributeUpdateCommand] | None = None
-        self._web_port     : int | None                                                   = None
-        self._web_url      : str | None                                                   = None
-        self._app_url      : str | None                                                   = None
+        self._process : IpcProcess | None = None
+        self._web_port: int        | None = None
+        self._web_url : str        | None = None
+        self._app_url : str        | None = None
 
     @property
     def port(self) -> int:
@@ -1246,7 +1578,7 @@ class WebSocketProcessManager:
     def app_url(self) -> str | None:
         return self._app_url
 
-    def _check_port_available(self, timeout_sec: float = 2.0) -> bool:
+    def _check_port_available(self, timeout_sec: float) -> bool:
         """Wait for port to become available."""
 
         start = time.monotonic()
@@ -1280,117 +1612,126 @@ class WebSocketProcessManager:
     def start(self, timeout_sec: float = 10.0) -> None:
         """Start the WebSocket subprocess."""
         if self._process is not None and self._process.is_alive():
-            _logger.info("WebSocket subprocess already running")
+            _logger.info("Visualisation service already running")
             return
 
-        # Wait for port to be available (previous subprocess may still be shutting down)
-        port_available = self._check_port_available(timeout_sec=2.0)
+        # Wait for port to be available (previous subprocess may still be shutting down).
+        # Use a proportional share of the overall timeout so callers can influence
+        # how long we tolerate a slow port release.
+        port_check_timeout = timeout_sec / 5
+        port_available = self._check_port_available(timeout_sec=port_check_timeout)
         if not port_available:
-            _logger.warning("Port %d still in use, attempting to continue anyway", self._config.port)
+            raise RuntimeError(
+                f"Port {self._config.host}:{self._config.port} is still in use after "
+                f"{port_check_timeout:.1f}s, cannot start Visualisation service"
+            )
 
-        # Use spawn context explicitly for clean subprocess
-        ctx = multiprocessing.get_context('spawn')
-
-        self._ready_queue   = ctx.Queue()
-        self._command_queue = ctx.Queue()
-        self._process       = ctx.Process(
-            target = _run_websocket_subprocess,
-            args   = (self._config, self._ready_queue, self._command_queue),
-            daemon = True,
-            name   = "cl-websocket-subprocess",
+        self._process = IpcProcess(
+            target       = "cl._sim.visualisation._websocket_subprocess:run_from_stdin",
+            process_name = "cl-websocket-subprocess",
         )
         _logger.info("Starting subprocess...")
         self._process.start()
+        self._process.send_message({
+            "type"  : "start",
+            "config": asdict(self._config),
+        })
         _logger.info("Subprocess started, PID=%d, waiting for server to be ready...", self._process.pid)
 
         # First, wait for a message from the subprocess (error or ready)
         # This is more reliable than checking port connectivity
-        start_time = time.monotonic()
+        start_time     = time.monotonic()
         ready_received = False
-        error_message = None
+        error_message  = None
 
         while (time.monotonic() - start_time) < timeout_sec:
             # Check if process is still alive
             if not self._process.is_alive():
                 exitcode = self._process.exitcode
-                _logger.error("WebSocket subprocess crashed with exit code %d", exitcode)
+                _logger.error("Visualisation service crashed with exit code %d", exitcode)
 
                 # Try to get any error message from queue
                 try:
-                    result = self._ready_queue.get(timeout=0.1)
+                    result = self._process.get_status(timeout=0.1)
                     if result.get("status") == "error":
                         error_message = result.get("error", "Unknown error")
-                except Exception:
+                except queue.Empty:
                     _logger.warning("Failed to get error message from subprocess after crash")
 
+                self.stop()
                 if error_message:
-                    raise RuntimeError(f"WebSocket subprocess initialization failed: {error_message}")
+                    raise RuntimeError(f"Visualisation service initialisation failed: {error_message}")
                 else:
-                    raise RuntimeError(f"WebSocket subprocess crashed with exit code {exitcode}")
+                    raise RuntimeError(f"Visualisation service crashed with exit code {exitcode}")
 
             # Try to get ready message from queue (non-blocking)
             try:
-                result = self._ready_queue.get(timeout=0.1)
+                result = self._process.get_status(timeout=0.1)
                 if result.get("status") == "error":
                     error_message = result.get("error", "Unknown error")
-                    raise RuntimeError(f"WebSocket subprocess initialization failed: {error_message}")
+                    self.stop()
+                    raise RuntimeError(f"Visualisation service initialisation failed: {error_message}")
                 elif result.get("status") == "ready":
                     self._web_port = result.get("web_port")
                     self._web_url  = result.get("web_url")
                     self._app_url  = result.get("app_url")
                     ready_received = True
                     break
-            except Exception as e:
+            except queue.Empty as e:
                 _logger.debug("Waiting for subprocess ready signal... (%s)", e)
 
             time.sleep(0.1)
 
         if not ready_received:
             elapsed = time.monotonic() - start_time
-            _logger.error("WebSocket subprocess did not signal ready after %.1fs", elapsed)
+            _logger.error("Visualisation service did not signal ready after %.1fs", elapsed)
 
             # Check if process is still alive
             if self._process.is_alive():
-                _logger.error("Subprocess still alive (PID=%d) but didn't send ready message", self._process.pid)
+                _logger.error("Visualisation service still alive (PID=%d) but didn't send ready message", self._process.pid)
                 # Try to get error from queue one more time
                 try:
-                    result = self._ready_queue.get(timeout=0.5)
+                    result = self._process.get_status(timeout=0.5)
                     if result.get("status") == "error":
                         error_message = result.get("error", "Unknown error")
-                        raise RuntimeError(f"WebSocket subprocess initialization failed: {error_message}")
-                except Exception as e:
+                except queue.Empty as e:
                     _logger.warning("Failed to get error message from subprocess after timeout: %s", e)
 
-                raise RuntimeError("WebSocket subprocess failed to start: no ready signal received")
-            else:
-                raise RuntimeError("WebSocket subprocess crashed before sending ready signal")
+                self.stop()
+                if error_message:
+                    raise RuntimeError(f"Visualisation service initialisation failed: {error_message}")
 
-        _logger.info("WebSocket subprocess started on port %d", self._config.port)
+                raise RuntimeError("Visualisation service failed to start: no ready signal received")
+            else:
+                self.stop()
+                raise RuntimeError("Visualisation service crashed before sending ready signal")
+
+        _logger.info("Visualisation service started on port %d", self._config.port)
         if self._web_url:
-            _logger.info("Data visualization at %s", self._web_url)
+            _logger.info("Data visualisation at %s", self._web_url)
         if self._app_url:
             _logger.info("Application visualisation at %s", self._app_url)
 
     def send_attribute_update(self, stream_name: str, updated_attributes: dict) -> None:
         """Send an attribute update command to the subprocess."""
-        if self._command_queue is not None:
+        if self._process is not None:
             with contextlib.suppress(Exception):
-                self._command_queue.put_nowait(
-                    AttributeUpdateCommand(
+                self._process.send_message(
+                    websocket_command_to_message(AttributeUpdateCommand(
                         stream_name        = stream_name,
                         updated_attributes = updated_attributes
-                    )
+                    ))
                 )
 
     def send_attribute_reset(self, stream_name: str, attributes: dict) -> None:
         """Send an attribute reset command to the subprocess."""
-        if self._command_queue is not None:
+        if self._process is not None:
             with contextlib.suppress(Exception):
-                self._command_queue.put_nowait(
-                    AttributeResetCommand(
+                self._process.send_message(
+                    websocket_command_to_message(AttributeResetCommand(
                         stream_name = stream_name,
                         attributes  = attributes
-                    )
+                    ))
                 )
 
     def stop(self) -> None:
@@ -1404,11 +1745,35 @@ class WebSocketProcessManager:
                     self._process.join(timeout=1.0)  # Wait for kill to complete
             self._process = None
 
-        if self._ready_queue is not None:
-            self._ready_queue = None
-
-        _logger.info("WebSocket subprocess stopped")
+        _logger.info("Visualisation service stopped")
 
     def is_alive(self) -> bool:
         """Check if subprocess is running."""
         return self._process is not None and self._process.is_alive()
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the CL SDK Visualisation service")
+    parser.add_argument("--process-name", default="cl-websocket-subprocess")
+    parser.parse_args()
+    run_from_stdin()
+
+def run_from_stdin() -> None:
+    import sys
+
+    initial_message = read_ipc_message(sys.stdin)
+    if initial_message.get("type") != "start":
+        raise ValueError(f"Expected start message, got {initial_message.get('type')!r}")
+
+    command_queue: queue.Queue[AttributeUpdateCommand | AttributeResetCommand] = queue.Queue()
+    start_ipc_command_reader(command_queue, decode=websocket_command_from_message)
+
+    _run_websocket_subprocess(
+        config        = SubprocessConfig(**initial_message["config"]),
+        ready_queue   = StdoutStatusWriter(),
+        command_queue = command_queue,
+    )
+
+if __name__ == "__main__":
+    main()

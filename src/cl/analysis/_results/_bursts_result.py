@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from .. import (
     Array1DInt,

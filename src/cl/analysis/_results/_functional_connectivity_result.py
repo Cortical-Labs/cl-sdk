@@ -1,10 +1,11 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 
-import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
-from matplotlib.gridspec import GridSpec
-
-import networkx as nx
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 from .. import Array2DFloat, AnalysisResult
 
@@ -56,6 +57,10 @@ class AnalysisResultsFunctionalConnectivity(AnalysisResult):
             save_path: Path to the save the plot instead of showing it.
             ax:        Axes draw the plots. (Defaults to None).
         """
+        import matplotlib.pyplot as plt
+        import networkx as nx
+        from matplotlib.gridspec import GridSpec
+
         # Reference results data
         adjacency_marix       = self.adjacency_matrix
         graph_partition       = self.graph_partition

@@ -2,7 +2,7 @@
 
 import os
 
-os.environ["CL_SDK_WEBSOCKET"] = "1"
+os.environ["CL_SDK_VISUALISATION"] = "1"
 os.environ["CL_SDK_ACCELERATED_TIME"] = "0"
 
 import time

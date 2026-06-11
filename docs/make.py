@@ -2,8 +2,14 @@
 This builds the Cortical Labs API documentation using source code from src/cl
 and places it in docs/html.
 """
+import os
+
+os.environ["PDOC_ALLOW_EXEC"] = "1"  # Allow pdoc to run subprocesses (as cl-sdk does for its data producer etc.)
+
+import argparse
 import re
 import sys
+import ast
 import shutil
 
 from pathlib import Path
@@ -22,6 +28,11 @@ from ._pdoc_pydantic_patch import *
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser(description="Build CL SDK documentation")
+    parser.add_argument("--base-url", default="", help="URL prefix for hosted docs (e.g., /sdk-docs)")
+    args = parser.parse_args()
+    base_url = args.base_url.rstrip("/")
+
     module_path    = here / ".." / "src" / "cl"
     output_path    = here / "html"
     assets_to_copy = \
@@ -38,8 +49,8 @@ if __name__ == "__main__":
     # Render docs
     pdoc.render.configure(
         docformat          = "google",
-        favicon            = "/favicon.png",
-        logo               = "/images/logo.svg",
+        favicon            = f"{base_url}/favicon.png",
+        logo               = f"{base_url}/images/logo.svg",
         logo_link          = "https://corticallabs.com",
         math               = True,
         show_source        = False,
@@ -79,8 +90,101 @@ if __name__ == "__main__":
         return tree
 
     index_md = (here / "index.md").read_text()
+
+    def _link_index_to_module(index_md):
+        """Allow module declarations in index.md to link to module docs."""
+
+        # Build a dynamic registry of API endpoints by parsing Python files
+        api_links = {"cl": "cl.html"}
+
+        def _add_link(current_path):
+            # pdoc generates anchors relative to the module, so we strip the 'cl.' prefix
+            anchor = current_path[3:] if current_path.startswith("cl.") else current_path
+            link   = f"cl.html#{anchor}"
+
+            api_links[current_path] = link
+
+            # Register short name (e.g., 'Spike' -> 'cl.Spike')
+            short_name = current_path.split('.')[-1]
+            if short_name not in api_links:
+                api_links[short_name] = link
+
+            # Register ClassName.member (e.g., 'Spike.samples')
+            if current_path.count('.') >= 2:
+                class_member = ".".join(current_path.split('.')[-2:])
+                if class_member not in api_links:
+                    api_links[class_member] = link
+
+        for py_file in module_path.rglob("*.py"):
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    if not node.name.startswith("_"):
+                        class_path = f"cl.{node.name}"
+                        _add_link(class_path)
+                        for child in node.body:
+                            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and not child.name.startswith("_"):
+                                _add_link(f"{class_path}.{child.name}")
+                            elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                                if not child.target.id.startswith("_"):
+                                    _add_link(f"{class_path}.{child.target.id}")
+                            elif isinstance(child, ast.Assign):
+                                for target in child.targets:
+                                    if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                                        _add_link(f"{class_path}.{target.id}")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not node.name.startswith("_"):
+                        _add_link(f"cl.{node.name}")
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    if not node.target.id.startswith("_"):
+                        _add_link(f"cl.{node.target.id}")
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                            _add_link(f"cl.{target.id}")
+
+        # Register subpackage links (e.g. cl.sim → cl/sim.html)
+        for init_file in sorted(module_path.rglob("__init__.py")):
+            if init_file.parent == module_path:
+                continue  # skip the root cl/__init__.py
+            rel_parts   = init_file.parent.relative_to(module_path.parent).parts
+            module_name = ".".join(rel_parts)
+            html_path   = "/".join(rel_parts) + ".html"
+            api_links[module_name] = html_path
+            short_name = rel_parts[-1]
+            if short_name not in api_links:
+                api_links[short_name] = html_path
+
+        def _linkify_backticks(match):
+            text   = match.group(1)
+            lookup = text.replace('()', '')
+
+            # 1. Exact match (e.g., 'cl', 'cl.Loop', 'Spike')
+            if lookup in api_links:
+                return f"[`{text}`]({api_links[lookup]})"
+
+            # 2. Fallback for instance chains (e.g., 'tick.analysis.spikes' -> 'spikes')
+            parts = lookup.split('.')
+            for i in range(1, len(parts)):
+                suffix = ".".join(parts[i:])
+                if suffix in api_links:
+                    return f"[`{text}`]({api_links[suffix]})"
+
+            return match.group(0)
+
+        index_md = re.sub(r"`([a-zA-Z0-9_.]+(?:\(\))?)`", _linkify_backticks, index_md)
+
+        return index_md
+
+    index_md = _link_index_to_module(index_md)
+
     pdoc.render.env.globals["preamble"] = index_md
     pdoc.render.env.globals["build_module_tree"] = _build_module_tree
+    pdoc.render.env.globals["base_url"] = base_url
 
     pdoc.pdoc(module_path, output_directory=output_path)
 
@@ -93,6 +197,8 @@ if __name__ == "__main__":
     for html_file in output_path.rglob("*.html"):
         html_text = html_file.read_text(encoding="utf-8")
         cleaned_html = pattern.sub("", html_text)
+        if base_url:
+            cleaned_html = cleaned_html.replace('url("/images/', f'url("{base_url}/images/')
         if cleaned_html != html_text:
             html_file.write_text(cleaned_html, encoding="utf-8")
 

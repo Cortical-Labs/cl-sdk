@@ -1,9 +1,5 @@
 import numpy as np
 
-import networkx as nx
-
-from community import community_louvain
-
 from ...util import RecordingView
 from .. import AnalysisResultsFunctionalConnectivity
 
@@ -15,23 +11,27 @@ def _analyse_functional_connectivity(
     """
     See RecordingView.analyse_functional_connectivity()
     """
+    import networkx as nx
+    from community import community_louvain
+
     from .._metrics._mea_layout import _valid_common_layout
     if not _valid_common_layout(recording):
         raise ValueError("Recording does not conform to common MEA layout.")
 
-    assert 0.0 <= correlation_threshold <= 1.0, f"Correlation threshold must be in [0, 1]."
+    assert 0.0 <= correlation_threshold <= 1.0, "Correlation threshold must be in [0, 1]."
 
     sampling_frequency       = recording._analysis_cache.metadata.sampling_frequency
     bin_size_frames          = int(bin_size_sec * sampling_frequency)
     spike_count_array        = recording._analysis_cache.get_spike_count_per_time_bin(bin_size_frames).todense()
     channel_count, bin_count = spike_count_array.shape
+    adjacency_matrix         = np.zeros((channel_count, channel_count), dtype=float)
 
     # Init result
     result = AnalysisResultsFunctionalConnectivity(
         metadata                   = recording._analysis_cache.metadata,
         bin_size_sec               = bin_size_sec,
         correlation_threshold      = correlation_threshold,
-        adjacency_matrix           = np.zeros((channel_count, channel_count), dtype=float),
+        adjacency_matrix           = adjacency_matrix,
         total_edge_weights         = 0.0,
         average_edge_weights       = 0.0,
         clustering_coefficient     = 0.0,
@@ -44,10 +44,21 @@ def _analyse_functional_connectivity(
         # Not enough data to define correlations
         return result
 
-    # Functional connectivity with Pearson correlation without self-connections
-    adjacency_matrix = np.corrcoef(spike_count_array)
-    np.nan_to_num(adjacency_matrix, nan=0.0, copy=False)
-    np.fill_diagonal(adjacency_matrix, val=0.0)
+    # Functional connectivity with Pearson correlation without self-connections.
+    # Channels with no spikes have zero variance, causing corrcoef to emit RuntimeWarning
+    # since it divides by stddev. Use corrcoef on a smaller corr_submatrix that
+    # has spikes, then assign the values back.
+    spike_count_dense = np.asarray(spike_count_array)
+    std_devs          = spike_count_dense.std(axis=1)
+    active_mask       = std_devs > 0
+
+    if active_mask.sum() < 2:
+        return result
+
+    active_indices = np.where(active_mask)[0]
+    corr_submatrix = np.corrcoef(spike_count_dense[active_mask])
+    np.fill_diagonal(corr_submatrix, 0.0)
+    adjacency_matrix[active_indices[:, None], active_indices[None, :]] = corr_submatrix
 
     # Apply thresholding
     if correlation_threshold > 0.0:

@@ -4,14 +4,11 @@
 This module provides utility methods for displaying visualisations in Jupyter notebooks.
 """
 
-import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
-from IPython.display import HTML, display
-
-from cl import ChannelSet
+from cl import ChannelSet, is_simulator
 
 from .visualisation import create_iframe_visualiser, create_visualiser
 
@@ -35,6 +32,7 @@ def display_visualiser(
         use_sidebar: Whether to enable the sidebar layout for the visualiser, when used in Jupyter notebook/lab environment.
         aspect_ratio: Optional aspect ratio (width / height) for the visualiser display area. If not provided, height is determined from the content.
     """
+    from IPython.display import HTML, display
     display(
         HTML(
             create_visualiser(
@@ -63,4 +61,34 @@ def show_activity(
         **kwargs: Additional query parameters to pass to the visualiser.
     """
 
-    print("Warning: show_activity() is currently not supported in cl-sdk", file=sys.stderr)
+    # TODO: Add proper support
+    # Handle focus_on_channels parameter by adding to kwargs
+    if focus_on_channels is not None:
+        if isinstance(focus_on_channels, int):
+            focus_on_channels = [focus_on_channels]
+        elif isinstance(focus_on_channels, ChannelSet):
+            focus_on_channels = list(focus_on_channels)
+        kwargs['focusOnChannels'] = ",".join(str(ch) for ch in focus_on_channels)
+
+    endpoint     = "visualiser"
+    query_params = "&".join(f"{key}={value}" for key, value in kwargs.items())
+
+    if is_simulator():
+        from cl import Neurons
+        iframe_url = f"/{endpoint}?jupyterMode=1&sidebarMode={int(use_sidebar)}&plotMode={mode}&{query_params}"
+        neurons    = Neurons._get_instance()
+        neurons._start_simulator_services()
+    else:
+        endpoint   = "vis" if mode == "2d" else "mea"
+        iframe_url = f"/{endpoint}/?jupyterMode=1&sidebarMode={int(use_sidebar)}&{query_params}"
+
+    from IPython.display import HTML, display
+    display(
+        HTML(
+            create_iframe_visualiser(
+                iframe_url   = iframe_url,
+                use_sidebar  = use_sidebar,
+                aspect_ratio = 16 / 9,
+            )
+        )
+    )

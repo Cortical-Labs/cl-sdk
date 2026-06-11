@@ -4,7 +4,7 @@ Base classes for producer workers and their interfaces.
 This module provides abstract base classes that capture common patterns
 between DataProducer and PlaybackProducer:
 
-- BaseProducerWorker: Common subprocess worker utilities (file I/O, buffer, GC)
+- BaseProducerWorker: Common subprocess worker utilities (buffer, GC, timing)
 - BaseProducer: Common main-process interface (start/stop, buffer management)
 
 The base classes provide common utilities but allow subclasses to implement
@@ -17,15 +17,13 @@ import contextlib
 import gc
 import logging
 import os
+import sys
 import time
+import traceback
 from abc import ABC, abstractmethod
-from multiprocessing import Process, Queue
-from pathlib import Path
-
-import numpy as np
-import tables
 
 from ._data_buffer import SharedDataBuffer, SpikeRecord, StimRecord
+from ._subprocess import PopenProcess
 
 _logger = logging.getLogger("cl.base_producer")
 
@@ -36,46 +34,42 @@ class BaseProducerWorker(ABC):
 
     Provides common utilities:
     - Shared buffer attachment
-    - Replay file opening (samples, spikes)
-    - Spike timestamp loading for binary search
     - GC management for low-jitter operation
+    - Tick-rate sleep helper
+    - Buffer spike/stim write helpers
     - Cleanup on exit
 
-    Subclasses implement their own run() loop and use the utilities.
+    Subclasses implement their own run() loop and own any source-specific
+    state (replay files, live data sources, etc.).
     """
 
     def __init__(
         self,
-        replay_file_path : str,
         channel_count    : int,
         frames_per_second: int,
         tick_rate_hz     : int,
-        command_queue    : Queue,
         name_prefix      : str,
+        start_timestamp  : int = 0,
+        duration_frames  : int = 0,
     ):
-        self._replay_file_path  = replay_file_path
         self._channel_count     = channel_count
         self._frames_per_second = frames_per_second
-        self._command_queue     = command_queue
         self._name_prefix       = name_prefix
 
         # Calculate frames per tick (subclasses may override)
         self._frames_per_tick  = max(1, frames_per_second // tick_rate_hz)
         self._tick_duration_ns = 1_000_000_000 // tick_rate_hz
 
+        # Common playback state
+        self._start_timestamp   = start_timestamp
+        self._duration_frames   = duration_frames
+        self._current_timestamp = start_timestamp
+
         # State
         self._running = False
 
         # Shared buffer (attached via attach_buffer())
         self._buffer: SharedDataBuffer | None = None
-
-        # Replay file handle and data references (opened via open_replay_file())
-        self._replay_file   : tables.File | None = None
-        self._replay_samples: tables.Array | None = None
-        self._replay_spikes : tables.Table | None = None
-
-        # Pre-loaded timestamp array for efficient binary search
-        self._spike_timestamps: np.ndarray | None = None
 
     @property
     def buffer(self) -> SharedDataBuffer | None:
@@ -90,6 +84,20 @@ class BaseProducerWorker(ABC):
     # --- Common utility methods ---
 
     @staticmethod
+    def run_in_subprocess(worker: BaseProducerWorker, label: str = "Producer") -> None:
+        """Run a producer worker with standard subprocess error handling."""
+        try:
+            worker.run()
+        except KeyboardInterrupt:
+            with contextlib.suppress(Exception):
+                worker.cleanup()
+        except Exception as e:
+            print(f"{label} subprocess failed: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            raise
+
+    @staticmethod
     def set_process_priority() -> None:
         """Set higher process priority to help ensure stable timing."""
         with contextlib.suppress(OSError, AttributeError):
@@ -102,42 +110,11 @@ class BaseProducerWorker(ABC):
         Returns the attached buffer and stores it in self._buffer.
         """
         self._buffer = SharedDataBuffer.attach(
-            as_producer=True,
-            name_prefix=self._name_prefix
+            as_producer                      = True,
+            name_prefix                      = self._name_prefix,
+            unregister_from_resource_tracker = True,
         )
         return self._buffer
-
-    def open_replay_file(self) -> None:
-        """
-        Open the replay H5 file and set up samples/spikes references.
-
-        Sets self._replay_file, self._replay_samples, self._replay_spikes.
-        Subclasses can call this then add their own data loading (stims, datastreams).
-        """
-        h5file = tables.open_file(self._replay_file_path, mode='r')
-
-        # Get samples (required)
-        if not hasattr(h5file.root, 'samples'):
-            raise ValueError("Recording file missing 'samples' dataset")
-        self._replay_samples = h5file.root.samples
-
-        # Get spikes (optional)
-        self._replay_spikes = h5file.root.spikes if hasattr(h5file.root, 'spikes') else None
-
-        # Store file handle
-        self._replay_file = h5file
-
-    def load_spike_timestamps(self) -> None:
-        """Load spike timestamps into memory for efficient binary search."""
-        if self._replay_spikes is None:
-            self._spike_timestamps = np.array([], dtype=np.int64)
-            return
-
-        spike_count = len(self._replay_spikes)
-        self._spike_timestamps = np.zeros(spike_count, dtype=np.int64)
-
-        for i in range(spike_count):
-            self._spike_timestamps[i] = int(self._replay_spikes[i]["timestamp"])
 
     @staticmethod
     def disable_gc() -> None:
@@ -151,54 +128,13 @@ class BaseProducerWorker(ABC):
         gc.enable()
         gc.collect()
 
-    def read_spikes_in_range(
-        self,
-        from_timestamp  : int,
-        to_timestamp    : int,
-        timestamp_offset: int = 0,
-    ) -> list[SpikeRecord]:
-        """
-        Read spikes from the replay file within a timestamp range.
+    def _process_commands(self) -> None:
+        """Process shared-memory control state. Subclasses may override."""
+        if self._buffer is not None and self._buffer.shutdown_flag:
+            self._running = False
 
-        Uses binary search on pre-loaded timestamps for efficiency.
-
-        Args:
-            from_timestamp: Start timestamp (inclusive, in file coordinates)
-            to_timestamp: End timestamp (exclusive, in file coordinates)
-            timestamp_offset: Offset to add to spike timestamps in result
-
-        Returns:
-            List of SpikeRecord for spikes in the range
-        """
-        if (
-            self._replay_spikes is None or
-            self._spike_timestamps is None or
-            len(self._spike_timestamps) == 0
-        ):
-            return []
-
-        # Binary search for range
-        left_idx  = np.searchsorted(self._spike_timestamps, from_timestamp, side="left")
-        right_idx = np.searchsorted(self._spike_timestamps, to_timestamp, side="left")
-
-        result = []
-        for i in range(left_idx, right_idx):
-            spike = self._replay_spikes[i]
-            result.append(SpikeRecord(
-                timestamp           = int(spike["timestamp"]) + timestamp_offset,
-                channel             = int(spike["channel"]),
-                channel_mean_sample = 0.0,  # Not typically stored in recording
-                samples             = np.array(spike["samples"], dtype=np.float32)
-            ))
-
-        return result
-
-    def get_next_command(self):
-        """Get the next command from the queue, or None if empty."""
-        try:
-            return self._command_queue.get_nowait()
-        except Exception:
-            return None
+    def _handle_command(self, cmd: object) -> None:
+        """Handle a single non-shutdown command. Override in subclasses."""
 
     def sleep_until_next_tick(
         self,
@@ -218,26 +154,20 @@ class BaseProducerWorker(ABC):
         if self._buffer is None:
             return
 
-        for spike in spikes:
-            self._buffer.write_spike(spike)
+        self._buffer.write_spikes(spikes)
 
     def write_stims_to_buffer(self, stims: list[StimRecord]) -> None:
         """Write a list of stims to the shared buffer."""
         if self._buffer is None:
             return
 
-        for stim in stims:
-            self._buffer.write_stim(stim)
+        self._buffer.write_stims(stims)
 
     def cleanup(self) -> None:
         """Clean up resources - call at end of run()."""
         if self._buffer:
             self._buffer.close()
             self._buffer = None
-
-        if self._replay_file is not None:
-            self._replay_file.close()
-            self._replay_file = None
 
         BaseProducerWorker.enable_gc()
         _logger.info("Producer stopped")
@@ -246,18 +176,7 @@ class BaseProducerWorker(ABC):
 
     @abstractmethod
     def run(self) -> None:
-        """
-        Main producer loop.
-
-        Subclasses implement their own loop using the utility methods:
-        - set_process_priority()
-        - attach_buffer()
-        - open_replay_file()
-        - load_spike_timestamps()
-        - disable_gc()
-        - read_spikes_in_range()
-        - cleanup()
-        """
+        """Main producer loop. Subclasses implement their own loop using the utility methods."""
 
 
 class BaseProducer(ABC):
@@ -270,28 +189,28 @@ class BaseProducer(ABC):
     - Buffer property access
 
     Subclasses implement:
-    - _create_process(): Create the subprocess Process object
-    - _send_shutdown(): Send shutdown command to subprocess
+    - _create_process(): Create the subprocess handle
     """
 
     def __init__(
         self,
-        replay_file_path : str | Path,
         channel_count    : int,
         frames_per_second: int,
+        start_timestamp  : int = 0,
+        duration_frames  : int = 0,
+        tick_rate_hz     : int = 5000,
     ):
-        self._replay_file_path  = str(replay_file_path) if isinstance(replay_file_path, Path) else replay_file_path
         self._channel_count     = channel_count
         self._frames_per_second = frames_per_second
+        self._start_timestamp   = start_timestamp
+        self._duration_frames   = duration_frames
+        self._tick_rate_hz      = tick_rate_hz
 
         # State
-        self._started    = False
-        self._process    : Process | None = None
+        self._started    : bool                    = False
+        self._process    : PopenProcess     | None = None
         self._buffer     : SharedDataBuffer | None = None
-        self._name_prefix: str | None = None
-
-        # Command queue (main -> producer)
-        self._command_queue: Queue = Queue()
+        self._name_prefix: str              | None = None
 
     @property
     def buffer(self) -> SharedDataBuffer | None:
@@ -322,13 +241,27 @@ class BaseProducer(ABC):
             return self._buffer.pause_flag
         return False
 
-    def start(self, timeout: float = 15.0, start_timestamp: int = 0) -> None:
+    @property
+    def duration_frames(self) -> int:
+        """Get total duration in frames."""
+        return self._duration_frames
+
+    @property
+    def start_timestamp(self) -> int:
+        """Get the recording start timestamp."""
+        return self._start_timestamp
+
+    @property
+    def end_timestamp(self) -> int:
+        """Get the recording end timestamp."""
+        return self._start_timestamp + self._duration_frames
+
+    def start(self, timeout: float = 15.0) -> None:
         """
         Start the producer subprocess.
 
         Args:
             timeout: Maximum time to wait for producer to signal ready
-            start_timestamp: Starting timestamp for the buffer
         """
         if self._started:
             return
@@ -337,7 +270,7 @@ class BaseProducer(ABC):
         self._buffer = SharedDataBuffer.create(
             channel_count     = self._channel_count,
             frames_per_second = self._frames_per_second,
-            start_timestamp   = start_timestamp,
+            start_timestamp   = self._start_timestamp,
         )
         self._name_prefix = self._buffer.get_name_prefix()
 
@@ -350,8 +283,12 @@ class BaseProducer(ABC):
         # Wait for producer to signal ready
         start_time = time.time()
         while not self._buffer.producer_ready:
+            if self._process is not None and not self._process.is_alive():
+                exitcode = self._process.exitcode
+                self._cleanup_after_failed_start()
+                raise RuntimeError(f"Producer subprocess exited early with code {exitcode}")
             if time.time() - start_time > timeout:
-                self.stop()
+                self._cleanup_after_failed_start()
                 raise TimeoutError("Producer did not start within timeout")
             time.sleep(0.01)
 
@@ -363,10 +300,6 @@ class BaseProducer(ABC):
         if not self._started:
             return
 
-        # Send shutdown command
-        self._send_shutdown()
-
-        # Also set shutdown flag in buffer
         if self._buffer:
             self._buffer.shutdown_flag = True
 
@@ -386,6 +319,22 @@ class BaseProducer(ABC):
         self._started = False
         _logger.info("Producer stopped")
 
+    def _cleanup_after_failed_start(self) -> None:
+        """Release resources allocated before producer startup completed."""
+        if self._process is not None and self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1.0)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=1.0)
+        self._process = None
+
+        if self._buffer:
+            self._buffer.close(unlink=True)
+            self._buffer = None
+
+        self._started = False
+
     def set_paused(self, paused: bool) -> None:
         """Set the pause state of the producer."""
         if self._buffer:
@@ -394,17 +343,9 @@ class BaseProducer(ABC):
     # --- Abstract methods for subclasses ---
 
     @abstractmethod
-    def _create_process(self) -> Process:
+    def _create_process(self) -> PopenProcess:
         """
-        Create the subprocess Process object.
+        Create the subprocess handle.
 
-        Override to create Process with appropriate target and args.
-        """
-
-    @abstractmethod
-    def _send_shutdown(self) -> None:
-        """
-        Send shutdown command to the subprocess.
-
-        Override to put shutdown command on queue.
+        Override to create PopenProcess with appropriate module and config.
         """

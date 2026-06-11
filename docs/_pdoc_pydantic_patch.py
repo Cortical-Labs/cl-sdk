@@ -5,6 +5,7 @@ clutter and to show just the intended Type
 """
 import inspect
 import warnings
+from pathlib import Path
 from typing import Annotated, get_args, get_origin
 
 import pdoc._compat
@@ -123,10 +124,22 @@ def _patched_get_source(obj) -> str:
     inspect.getsource fails because it looks in the wrong file. This patch tries to
     find the source by looking at the class's actual definition location.
     """
+    source = None
     try:
-        return inspect.getsource(obj)
+        source = inspect.getsource(obj)
     except Exception:
         pass
+
+    # In Python 3.13+, inspect.getsource for classes uses __firstlineno__ as a line offset
+    # into the file returned by inspect.getfile (which follows __module__). When __module__
+    # is reassigned, the two files differ and getsource silently returns content from the
+    # wrong file (e.g. the module docstring in src/cl/app/model/__init__.py), causing a
+    # UserWarning when building docs.
+    if source is not None and isinstance(obj, type) and f"class {obj.__name__}" not in source:
+        source = None
+
+    if source is not None:
+        return source
 
     # For classes, try to find the source file from __qualname__ and module hierarchy
     if isinstance(obj, type):

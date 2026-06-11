@@ -1,4 +1,4 @@
-import { connect, setVisibleAbsUv, getVisibleAbsUv, getAnalysisToRender, getAnalysisMsPerResult, stimulate, reset, setDcOffsetCorrection, getDcOffsetCorrection, setHideCrosstalk, getHideCrosstalk } from '/visualiser/analysis.mjs';
+import { connect, setVisibleAbsUv, getVisibleAbsUv, getAnalysisToRender, getAnalysisMsPerResult, getIsPlaybackPaused, stimulate, reset, setDcOffsetCorrection, getDcOffsetCorrection, setHideCrosstalk, getHideCrosstalk, getUrlSearchParams } from '/visualiser/analysis.mjs';
 import { rowColChannelLayout } from '/visualiser/layout.mjs';
 
 connect(); // Start analysis module connection
@@ -10,24 +10,7 @@ connect(); // Start analysis module connection
 const minVisibleRangeAbs = 20;
 const maxVisibleRangeAbs = 6400;
 
-// Get URL parameters, supporting iframe embedding
-let searchParams;
-try {
-    searchParams = window.parent?.location.search ?? window.location.search;
-
-    // Merge with own search params to allow overrides
-    const parentParams = new URLSearchParams(searchParams);
-    const ownParams = new URLSearchParams(window.location.search);
-    for (const [key, value] of ownParams.entries()) {
-        parentParams.set(key, value);
-    }
-    searchParams = parentParams.toString() ? `?${parentParams.toString()}` : '';
-}
-catch (e) {
-    // Cross-origin iframe, fall back to own location
-    searchParams = window.location.search;
-}
-const urlParams = new URLSearchParams(searchParams);
+const urlParams = getUrlSearchParams();
 
 // Check if we're in Jupyter mode via the query parameter.
 // In Jupyter mode, user controls are hidden, click to stim is disabled, 2D mode is forced, keyboard shortcuts are disabled, and the visible range is fixed to 100uV.
@@ -36,7 +19,33 @@ const isJupyterMode = urlParams.get('jupyterMode') === '1';
 
 const isSideBarMode = urlParams.get('sidebarMode') === '1';
 
+const plotMode = urlParams.get('plotMode') || '2d';
+
 const focusOnChannels = urlParams.get('focusOnChannels')?.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+
+const meaGrid  = document.getElementById('mea-grid');
+const renderer = document.getElementById('renderer');
+
+const headerElement = document.querySelector('header');
+if (isJupyterMode)
+{
+    headerElement.style.display = 'none';
+    headerElement.hidden = true;
+
+    if (plotMode === '3d')
+    {
+        // Forced 3D mode, so flip the visibilities
+
+        meaGrid.style.display  = 'none';
+        meaGrid.hidden = true;
+        renderer.style.display = 'flex';
+        renderer.hidden = false;
+
+        // Stop 2D animation and start 3D
+        meaGrid.dispatchEvent(new Event('visibilitychange'));
+        renderer.dispatchEvent(new Event('visibilitychange'));
+    }
+}
 
 document.onkeydown =
     event =>
@@ -76,7 +85,7 @@ window.paused   = false;
 window.resuming = false;
 const pause_toggle_button = document.querySelector("#pause_toggle");
 
-let visibleAbsUv = 50.0;
+let visibleAbsUv = 100.0;
 
 function pause_toggle()
 {
@@ -339,7 +348,7 @@ function setupPlotModeControl()
 {
     const uiPlotMode = document.querySelector('#plot-mode');
 
-    // In Jupyter mode, force 2D mode
+    // In Jupyter mode, force selected mode
     if (isJupyterMode)
     {
         return;
@@ -571,10 +580,8 @@ for (let row = 0; row < rowCount; row++)
 
 const canvasAll     = [];
 const contextAll    = [];
-const meaGrid       = document.getElementById('mea-grid');
-const renderer      = document.getElementById('renderer');
 
-if (isJupyterMode) {
+if (isJupyterMode && plotMode === '2d') {
     renderer.style.display = 'none';
     renderer.hidden = true;
     meaGrid.style.display = 'grid';
@@ -758,6 +765,13 @@ function render(timestamp)
     const pixelDelta      = Math.floor((timestamp - lastTimestamp) / analysisMsPerResult);
     const pixelDeltaMs    = pixelDelta * analysisMsPerResult;
     lastTimestamp        += pixelDeltaMs;
+
+    // When playback is paused, freeze the display without entering buffering mode
+    if (getIsPlaybackPaused())
+    {
+        lastTimestamp = timestamp;
+        return;
+    }
 
     const analysisToRender  = getAnalysisToRender(pixelDelta);
 

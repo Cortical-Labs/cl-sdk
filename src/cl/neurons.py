@@ -1,28 +1,61 @@
 from __future__ import annotations
 
-import logging
+import heapq
 import os
 import time
-from collections import defaultdict
-from pathlib import Path
+import warnings
+import atexit
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass
 from queue import PriorityQueue
 from random import randint
-from threading import Event, Lock, Thread
-from typing import TYPE_CHECKING, Any, ClassVar
+from threading import Event, Lock, RLock, Thread
+from typing import TYPE_CHECKING, Any, ClassVar, overload, Literal
 
 import numpy as np
 from dotenv import load_dotenv
 from numpy import ndarray
 
-from . import BurstDesign, ChannelSet, Loop, Spike, Stim, StimDesign, StimPlan, _logger
-from ._data_producer import DataProducer
-from ._stim_queue import ChannelStimQueue
+from . import _FRAME_TIME_US, BurstDesign, ChannelSet, Loop, Spike, Stim, StimDesign, StimPlan, _logger, DetectionResult
+from ._sim._data_buffer import DEFAULT_FRAMES_PER_SECOND, StimRecord
+from ._sim._data_producer import DataProducer
+from .sim._data_source import (
+    DEFAULT_DURATION_FRAMES,
+    default_data_source_config,
+    get_configured_data_source_config,
+    load_data_source_metadata,
+)
+from ._sim._stim_queue import ChannelStimQueue
 from .data_stream import DataStream
 from .recording import Recording
-from .util import RecordingView
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+_MINIMUM_LEAD_TIME_US = 80
+
+_INTERNAL_RATE_MULTIPLIER   = 2   # 50kHz internal / 25kHz external
+_EXTERNAL_FRAMES_PER_SECOND = DEFAULT_FRAMES_PER_SECOND
+
+_HEARTBEAT_INTERVAL_NS          = 10_000_000  # 10ms heartbeat interval for debugger detection
+_HEARTBEAT_INTERVAL_S           = _HEARTBEAT_INTERVAL_NS / 1e9
+_STIM_PUBLISH_ACTIVE_WINDOW_S   = 0.002   # 2ms
+_STIM_PUBLISH_ACTIVE_INTERVAL_S = 0.0001  # 100us
+
+def _to_external_ts(internal_ts: int) -> int:
+    """Convert internal 50kHz timestamp to external 25kHz timestamp."""
+    return internal_ts // _INTERNAL_RATE_MULTIPLIER
+
+def _to_internal_ts(external_ts: int) -> int:
+    """Convert external 25kHz timestamp to internal 50kHz timestamp."""
+    return external_ts * _INTERNAL_RATE_MULTIPLIER
+
+_NON_STIMMABLE_CHANNELS = ChannelSet(0, 7, 56, 63)
+
+_NOTICE_STEPS         = _MINIMUM_LEAD_TIME_US // _FRAME_TIME_US  # 4
+_CHANNEL_COMPLETE     = -1
+_GROUNDED_CHANNEL_SET = set(_NON_STIMMABLE_CHANNELS._tolist())
+_SYNC_ACTIVE          = -2
 
 class Neurons:
     """
@@ -51,82 +84,164 @@ class Neurons:
     def __init__(self):
         _logger.debug("using Cortical Labs Mock API")
 
-        self._read_lock = Lock()
+        self._stim_lock = RLock()
 
         self._loop_deadline_ts    = None
         self._loop_tick_timestamp = None
+        self._in_loop             = False
         self._websocket_server    = None
 
-    def __enter__(self):
-        """ (Simulator only) Open a H5 recording and set required attributes. """
-        from . import _CL_SDK_REPLAY_PATH
-
-        def load_replay_file() -> RecordingView:
-            from . import _CL_SDK_REPLAY_PATH
-            assert _CL_SDK_REPLAY_PATH is not None and Path(_CL_SDK_REPLAY_PATH).exists(), \
-                f"Recording not found: {_CL_SDK_REPLAY_PATH}"
-            _logger.debug(f"simulating from recording: {_CL_SDK_REPLAY_PATH}")
-            return RecordingView(_CL_SDK_REPLAY_PATH)
-
-        self._replay_file       = load_replay_file()
-        attrs                   = self._replay_file.attributes
-
-        self._start_timestamp   = int(attrs["start_timestamp"])
-        self._read_timestamp    = self._start_timestamp
-        self._channel_count     = int(attrs["channel_count"])
-        self._frames_per_second = int(attrs["frames_per_second"])
-        self._duration_frames   = int(attrs["duration_frames"])
-        self._frame_duration_us = int(1_000_000 / self._frames_per_second)
-        self._elapsed_frames    = 0
-
-        self._recordings                  = []
-        self._tick_stims                  = []
-        self._in_loop                     = False
-        self._stim_queue                  = ChannelStimQueue()
-        self._stim_channel_available_from = np.full((self._channel_count,), fill_value=self._start_timestamp, dtype=int)
-
-        # Per-instance mutable state (NOT class-level to avoid persistence across instances)
-        self._timed_ops                   = PriorityQueue()
-        self._data_streams                = {}
-
-        self._start_walltime_ns           = time.perf_counter_ns()
-        self._prev_walltime_ns            = self._start_walltime_ns
+        self._data_producer        = None
+        self._producer_lock        = Lock()  # Thread-safe producer startup
+        self._shared_buffer        = None
+        self._recordings           = []
+        self._heartbeat_thread     = None
+        self._heartbeat_stop_event = None
+        self._stim_publish_event   = Event()
+        self._buffer_name_prefix   = None
 
         load_dotenv(".env")
-        self._use_accelerated_time        = os.getenv("CL_SDK_ACCELERATED_TIME", "0") == "1"
+        configured_source = get_configured_data_source_config()
+        if configured_source is None:
+            self._data_source_config = default_data_source_config()
+            source_metadata          = load_data_source_metadata(self._data_source_config)
+
+            self._replay_start_offset = int(os.getenv("CL_SDK_REPLAY_START_OFFSET", "-1"))
+            if self._replay_start_offset < 0:
+                replay_duration = source_metadata.duration_frames or DEFAULT_DURATION_FRAMES
+                # _replay_start_offset is in 25kHz file frame units
+                self._replay_start_offset = randint(0, replay_duration)
+            self._data_source_config["replay_start_offset"] = self._replay_start_offset
+            _logger.debug(
+                "simulating from %s data source",
+                self._data_source_config.get("kind"),
+            )
+        else:
+            self._replay_start_offset = 0
+            self._data_source_config = configured_source
+            _logger.debug("simulating from custom data source: %s", configured_source.get("factory"))
+            source_metadata = load_data_source_metadata(self._data_source_config)
+        self._use_accelerated_time = os.getenv("CL_SDK_ACCELERATED_TIME", "0") == "1"
+        if self._use_accelerated_time and not source_metadata.supports_accelerated:
+            raise ValueError("Configured simulator data source does not support accelerated time")
+        self._data_source_config["metadata"] = asdict(source_metadata)
+
+        duration_frames = source_metadata.duration_frames or DEFAULT_DURATION_FRAMES
+        self._replay_attrs = {
+            "start_timestamp"   : int(source_metadata.start_timestamp),
+            "channel_count"     : int(source_metadata.channel_count),
+            "sampling_frequency": int(source_metadata.frames_per_second),
+            "frames_per_second" : int(source_metadata.frames_per_second),
+            "uV_per_sample_unit": float(source_metadata.uV_per_sample_unit),
+            "duration_frames"   : int(duration_frames),
+        }
+
+        self._start_timestamp   = int(self._replay_attrs["start_timestamp"]) * _INTERNAL_RATE_MULTIPLIER
+        self._read_timestamp    = self._start_timestamp
+        self._channel_count     = int(self._replay_attrs["channel_count"])
+        self._frames_per_second = int(self._replay_attrs["frames_per_second"]) * _INTERNAL_RATE_MULTIPLIER
+        self._duration_frames   = int(self._replay_attrs["duration_frames"]) * _INTERNAL_RATE_MULTIPLIER
+        self._frame_duration_us = 1_000_000 // self._frames_per_second
+        self._elapsed_frames    = 0
+
+        self._recordings = []
+        self._stim_queue = ChannelStimQueue()
+
+        self._stim_channel_available_from = np.full((self._channel_count,), fill_value=self._start_timestamp, dtype=int)
+
+        # Operation tracking for rebuild-on-interrupt
+        self._stim_op_records             : list[_StimOpRecord | _SyncOpRecord] = []
+        self._interrupt_records           : list[tuple[int, list[int], int]]    = []     # (from_timestamp, channels, stim_op_index)
+        self._rebuilding                  : bool                                = False
+        self._rebuild_pending             : bool                                = False
+        self._stim_history_has_rebuild_ops: bool                                = False
+        self._rebuild_affected_channels   : set[int]                            = set()  # channels in sync/multi-channel ops
+        self._pending_interrupts          : list[tuple[int, list[int]]]         = []     # interrupts not yet applied during rebuild
+        self._rebuild_checkpoint_avail    : np.ndarray | None                   = None   # channel availability snapshot for incremental rebuilds
+
+        self._timed_ops    = PriorityQueue()
+        self._data_streams = {}
+
         if not self._use_accelerated_time:
             _logger.debug("time policy: wall clock time")
         else:
             _logger.debug("time policy: accelerated")
 
-        self._replay_start_offset         = int(os.getenv("CL_SDK_REPLAY_START_OFFSET", "-1"))
-        if self._replay_start_offset < 0:
-            self._replay_start_offset     = randint(0, self._duration_frames)
+        self._start_walltime_ns = time.perf_counter_ns()
+        self._prev_walltime_ns = self._start_walltime_ns
 
         # Prepare the data producer (but don't start yet - lazy initialization)
-        assert _CL_SDK_REPLAY_PATH is not None, "Replay path must be set"
+        # The producer and shared buffer run at the external 25kHz rate.
+        # Internal 50kHz timestamps are only used for stim timing math.
         self._data_producer = DataProducer(
-            replay_file_path    = _CL_SDK_REPLAY_PATH,
-            start_timestamp     = self._start_timestamp,
-            replay_start_offset = self._replay_start_offset,
-            channel_count       = self._channel_count,
-            frames_per_second   = self._frames_per_second,
-            duration_frames     = self._duration_frames,
-            accelerated_time    = self._use_accelerated_time,
+            data_source_config = self._data_source_config,
+            start_timestamp    = _to_external_ts(self._start_timestamp),
+            channel_count      = self._channel_count,
+            frames_per_second  = _EXTERNAL_FRAMES_PER_SECOND,
+            duration_frames    = self._duration_frames // _INTERNAL_RATE_MULTIPLIER,
+            accelerated_time   = self._use_accelerated_time,
         )
         self._producer_started = False
-        self._producer_lock = Lock()  # Thread-safe producer startup
-        self._shared_buffer = None
 
         # Track timestamps for spike/stim reads (to avoid re-reading same data)
-        self._last_spike_read_ts = self._start_timestamp
-        self._last_stim_read_ts  = self._start_timestamp
+        self._last_spike_read_ts    = self._start_timestamp
+        self._last_stim_read_ts     = self._start_timestamp
+        self._stim_buffer_write_ts  = self._start_timestamp  # High-water mark for buffer stim writes
+        self._last_published_stim_timestamp: int | None = None
+
+        # Cadence marker for bounding the rebuild-history records (_stim_op_records /
+        # _interrupt_records) even when no rebuild is triggered. See _read_stims.
+        self._last_history_compact_ts = self._start_timestamp
 
         # Heartbeat thread for debugger detection
-        self._heartbeat_thread = None
+        self._heartbeat_thread     = None
         self._heartbeat_stop_event = None
 
+        self._buffer_name_prefix = None
+
+        # Whether to use the visualisation server
+        self._use_websocket_server = os.getenv("CL_SDK_VISUALISATION", os.getenv("CL_SDK_WEBSOCKET", "1")) == "1"     # CL_SDK_WEBSOCKET is deprecated
+        self._websocket_host       = os.getenv("CL_SDK_VISUALISATION_HOST", os.getenv("CL_SDK_WEBSOCKET_HOST", None)) # CL_SDK_WEBSOCKET_HOST is deprecated
+        if os.getenv("CL_SDK_VISUALISATION") is None and os.getenv("CL_SDK_WEBSOCKET") is not None:
+            warnings.warn("CL_SDK_WEBSOCKET is deprecated. Please use CL_SDK_VISUALISATION instead.", DeprecationWarning)
+        if self._use_accelerated_time and self._use_websocket_server:
+            _logger.warning("Visualisation service is not compatible with accelerated time. Disabling Visualisation service.")
+            os.environ["CL_SDK_VISUALISATION"] = "0"
+            os.environ["CL_SDK_WEBSOCKET"]     = "0"
+            self._use_websocket_server         = False
+
+    def __enter__(self):
+        """ (Simulator only) Open a H5 recording and set required attributes. """
+
+        self._recordings.clear()
+        self._in_loop = False
+        self._data_streams.clear()
+        self._start_simulator_services()
+        self._reset_stim_state()
+
         return self
+
+    def _reset_stim_state(self) -> None:
+        """Reset simulator stim scheduling state between open sessions."""
+        with self._stim_lock:
+            self._stim_queue.clear()
+            self._stim_channel_available_from.fill(self._start_timestamp)
+            self._stim_op_records.clear()
+            self._interrupt_records.clear()
+            self._rebuilding = False
+            self._rebuild_pending = False
+            self._stim_history_has_rebuild_ops = False
+            self._rebuild_affected_channels.clear()
+            self._pending_interrupts.clear()
+            self._rebuild_checkpoint_avail = None
+            self._last_published_stim_timestamp = None
+            self._stim_publish_event.clear()
+
+    def _start_simulator_services(self):
+        """Starts simulator services like the producer and websocket for visualisations."""
+        self._ensure_producer_started()
+        self._start_websocket_server(host=self._websocket_host)
+        atexit.register(Neurons._clear_instance, force=True)
 
     def _ensure_producer_started(self) -> None:
         """Start the producer subprocess if not already started (thread-safe)."""
@@ -145,7 +260,7 @@ class Neurons:
             # Reset wall-clock reference when producer actually starts
             # This ensures _sleep_until() calculations are accurate
             self._start_walltime_ns = time.perf_counter_ns()
-            self._prev_walltime_ns = self._start_walltime_ns
+            self._prev_walltime_ns  = self._start_walltime_ns
 
             # Start heartbeat thread for debugger detection
             self._start_heartbeat_thread()
@@ -159,34 +274,38 @@ class Neurons:
             if self._use_accelerated_time:
                 assert self._shared_buffer is not None
                 # Wait for producer to produce at least one batch
-                for _ in range(1000):  # 100ms max wait
-                    if self._shared_buffer.write_timestamp > self._start_timestamp:
+                for _ in range(2500):  # 100ms max wait
+                    if self._shared_buffer.write_timestamp > _to_external_ts(self._start_timestamp):
                         break
-                    time.sleep(0.0001)
+                    time.sleep(0.00004)  # 40us sleep per iteration to avoid busy wait
 
-    def _start_websocket_server(self, port: int = 1025, host: str = "127.0.0.1") -> None:
+    def _start_websocket_server(self, host: str | None = None, port: int | None = None) -> None:
         """
-        Start WebSocket server subprocess for visualization.
+        (Simulator only) Start WebSocket server subprocess for visualization.
 
         Args:
-            port: Port for WebSocket server
             host: Host address for WebSocket server
+            port: Port for WebSocket server (None for auto-find)
         """
         if self._websocket_server is not None:
             _logger.info("WebSocket server already running")
+            return
+
+        _use_websocket_server = os.getenv("CL_SDK_VISUALISATION", os.getenv("CL_SDK_WEBSOCKET", "1")) == "1"
+        if not _use_websocket_server:
             return
 
         # Ensure producer is running first (WebSocket reads from shared buffer)
         self._ensure_producer_started()
 
         # Lazy import so we don't need to load websocket dependencies if not using websocket visualization
-        from .visualisation._websocket_subprocess import WebSocketProcessManager
+        from ._sim.visualisation._websocket_subprocess import WebSocketProcessManager
 
         # Get the unique shared memory prefix from the producer's buffer
-        buffer_name_prefix = self._data_producer.buffer.get_name_prefix() if self._data_producer and self._data_producer.buffer else ""
+        self._buffer_name_prefix = self._data_producer.buffer.get_name_prefix() if self._data_producer and self._data_producer.buffer else ""
 
         self._websocket_server = WebSocketProcessManager(
-            buffer_name       = buffer_name_prefix,
+            buffer_name       = self._buffer_name_prefix,
             frames_per_second = self.get_frames_per_second(),
             channel_count     = self.get_channel_count(),
             port              = port,
@@ -194,18 +313,34 @@ class Neurons:
             app_html          = Neurons._app_html,
         )
         self._websocket_server.start()
-        _logger.info(f"WebSocket subprocess started on {host}:{port}")
+        _logger.info(f"Visualisation service started on {host}:{self._websocket_server.port}")
         if self._websocket_server.web_url:
             print(f"Data visualiser: {self._websocket_server.web_url}", flush=True)
         if self._websocket_server.app_url:
             print(f"Application visualiser: {self._websocket_server.app_url}", flush=True)
 
     def _stop_websocket_server(self) -> None:
-        """Stop WebSocket server subprocess if running."""
+        """(Simulator only) Stop WebSocket server subprocess if running."""
         if self._websocket_server is not None:
             self._websocket_server.stop()
             self._websocket_server = None
-            _logger.info("WebSocket subprocess stopped")
+            _logger.info("Visualisation service stopped")
+
+    @classmethod
+    def _get_http_port(cls) -> int | None:
+        """(Simulator only) Get the HTTP port number for the visualiser."""
+        neurons = cls._get_instance()
+        if neurons._websocket_server is None or not neurons._websocket_server.is_alive():
+            return None
+        return neurons._websocket_server.web_port
+
+    @classmethod
+    def _get_ws_port(cls) -> int | None:
+        """(Simulator only) Get the WebSocket port number for the visualiser."""
+        neurons = cls._get_instance()
+        if neurons._websocket_server is None or not neurons._websocket_server.is_alive():
+            return None
+        return neurons._websocket_server.port
 
     def __exit__(self, exception_type, exception_value, traceback):
         self.close()
@@ -213,6 +348,19 @@ class Neurons:
 
     def __del__(self):
         self.close()
+
+        # Stop WebSocket server subprocess first (it reads from the buffer)
+        self._stop_websocket_server()
+
+        # Stop heartbeat thread
+        self._stop_heartbeat_thread()
+
+        # Stop the data producer subprocess (always, even if not started via has_started)
+        if self._data_producer is not None:
+            self._data_producer.stop()
+            self._data_producer = None
+            self._shared_buffer = None
+            self._producer_started = False
 
     def stim(
         self,
@@ -258,7 +406,7 @@ class Neurons:
         """
 
         self._queue_stims(
-            from_timestamp = self.timestamp(),
+            from_timestamp = self._stim_command_timestamp(),
             channel_set    = channel_set,
             stim_design    = stim_design,
             burst_design   = burst_design,
@@ -273,7 +421,7 @@ class Neurons:
             channels: A `ChannelSet` object with one or more channels, or a single channel to interrupt.
         """
         self._interrupt_queued_stims(
-            from_timestamp = self.timestamp(),
+            from_timestamp = self._stim_command_timestamp(),
             channel_set    = channel_set
             )
 
@@ -299,31 +447,33 @@ class Neurons:
             burst_design:   A `BurstDesign` object specifying the burst count and frequency.
             lead_time_us:   The lead time in microseconds before the stimulation starts.
         """
-        self.interrupt(channel_set)
-        self.stim(channel_set, stim_design, burst_design, lead_time_us)
+        from_timestamp = self._stim_command_timestamp()
+        self._interrupt_queued_stims(
+            from_timestamp = from_timestamp,
+            channel_set    = channel_set
+        )
+        self._queue_stims(
+            from_timestamp = from_timestamp,
+            channel_set    = channel_set,
+            stim_design    = stim_design,
+            burst_design   = burst_design,
+            lead_time_us   = lead_time_us
+        )
 
     def sync(
         self,
-        channel_set:          ChannelSet,
-        /,
-        wait_for_frame_start: bool        = True
+        channel_set: ChannelSet,
+        /
         ) -> None:
         """
-        Prevent further queued stimulation until all channels have reached this sync point.
+        Cause all channel_set channels to wait until all are ready to continue together.
 
-        If `wait_for_frame_start` is `True`, the sync will wait until the start of the next frame.
-        This is generally preferred as it allows subsequent stimcode to be generated in a more
-        efficient form.
-
-        If `False`, it will not wait for the next frame start, allowing zero latency immediate
-        continuation of the stimulation plan. However, subsequent stimcode on these channels
-        within this plan be generated in a less efficient form. This option is useful for
-        switching between stim frequencies without sometimes adding an additional half-frame
-        of latency at the switch point.
+        The sync operation allows you ensure that subsequent operations on different channels
+        begin at the same time - after all previously queued operations on those channels have
+        completed.
 
         Args:
-            channel_set:            One or more channels to sync.
-            wait_for_frame_start:   Whether to wait for the next frame start before continuing.
+            channel_set: One or more channels to sync.
 
         For example:
 
@@ -359,14 +509,13 @@ class Neurons:
         ```
         """
         self._sync_channels(
-            self._loop_tick_timestamp if (self._in_loop and self._loop_tick_timestamp is not None) else self.timestamp(),
-            channel_set,
-            wait_for_frame_start = wait_for_frame_start
+            self._stim_command_timestamp(),
+            channel_set
             )
 
     def create_stim_plan(self) -> StimPlan:
         """
-        Create a new `StimPlan` object to build a stimcode plan.
+        Create a new `StimPlan` object to build a stimulation plan.
 
         Stim plans which are reusable stimulation instructions that can be created
         at the beginning of an application to run on demand and contain the same
@@ -589,6 +738,7 @@ class Neurons:
             recording.wait_until_stopped()
         ```
         """
+        assert self._replay_attrs is not None
         return \
             Recording(
                 file_suffix          = file_suffix,
@@ -607,10 +757,10 @@ class Neurons:
 
                 # Simulator only parameters
                 _neurons             = self,
-                _channel_count       = self._replay_file.attributes["channel_count"],
-                _sampling_frequency  = self._replay_file.attributes["sampling_frequency"],
-                _frames_per_second   = self._replay_file.attributes["frames_per_second"],
-                _uV_per_sample_unit  = self._replay_file.attributes["uV_per_sample_unit"],
+                _channel_count       = self._replay_attrs["channel_count"],
+                _sampling_frequency  = self._replay_attrs["frames_per_second"],
+                _frames_per_second   = self._replay_attrs["frames_per_second"],
+                _uV_per_sample_unit  = self._replay_attrs["uV_per_sample_unit"],
                 _data_streams        = self._data_streams
                 )
 
@@ -682,31 +832,66 @@ class Neurons:
         Get the number of frames per second the device is configured to produce.
         A frame is a single sample from each channel.
         """
-        return self._frames_per_second
+        return _EXTERNAL_FRAMES_PER_SECOND
 
     def get_frame_duration_us(self) -> float:
         """ Get the duration of a frame in microseconds. """
         return 1e6 / self.get_frames_per_second()
+
+    def _internal_timestamp(self) -> int:
+        """
+        (Simulator only) Get the current internal 50kHz timestamp.
+        The shared buffer runs at 25kHz; this converts to 50kHz.
+        """
+        self._ensure_producer_started()
+        assert self._shared_buffer is not None
+        return _to_internal_ts(self._shared_buffer.write_timestamp)
 
     def timestamp(self) -> int:
         """
         Get the current timestamp of the device.
         The timestamp sequence resets when the device is restarted.
         """
-        # Ensure producer is started (lazy initialization)
         self._ensure_producer_started()
-
         assert self._shared_buffer is not None
-
-        # Return timestamp from shared buffer (producer is source of truth)
         return self._shared_buffer.write_timestamp
+
+    def _stim_command_timestamp(self) -> int:
+        """Return the causal timestamp for a user stim command."""
+        if self._in_loop and self._loop_tick_timestamp is not None:
+            return self._loop_tick_timestamp
+        return self._internal_timestamp()
+
+    @overload
+    def read(
+        self,
+        frame_count:    int,
+        from_timestamp: int | None      = None,
+        /,
+        *,
+        analysis:       Literal[False]  = False
+        ) -> ndarray[tuple[int, int], np.dtype[np.int16]]:
+        ...
+
+    @overload
+    def read(
+        self,
+        frame_count:    int,
+        from_timestamp: int | None      = None,
+        /,
+        *,
+        analysis:       Literal[True]
+        ) -> DetectionResult:
+        ...
 
     def read(
         self,
         frame_count:    int,
         from_timestamp: int | None = None,
-        /
-    ) -> ndarray[tuple[int, int], np.dtype[np.int16]]:
+        /,
+        *,
+        analysis:       bool       = False
+        ) -> ndarray[tuple[int, int], np.dtype[np.int16]] | DetectionResult:
         """
         Read `frame_count` frames from the neurons, starting at `from_timestamp`
         if supplied.
@@ -717,51 +902,58 @@ class Neurons:
         blocking.
 
         Args:
-            frame_count:    Number of frames to return.
-            from_timestamp: Read from a specific timestamp. If None, return
+            frame_count:    Number of frames to return (at 25kHz).
+            from_timestamp: Read from a specific timestamp (at 25kHz). If None, return
                             from the current timestamp.
+            analysis:       When `True`, return `DetectionResult` instead of raw frames.
 
         Returns:
-            Frames as an array with shape (frame_count, channel_count).
+            Frames as an array with shape (frame_count, channel_count) if
+            `analysis=False` or `DetectionResult` if `analysis=True`.
         """
         # Ensure producer is started (lazy initialization)
         self._ensure_producer_started()
 
         assert self._shared_buffer is not None
 
-        # Calculate required timestamps
+        # Buffer operates at external 25kHz — use parameters directly
         now = self._shared_buffer.write_timestamp
         if from_timestamp is None:
-            from_timestamp = now
-        to_timestamp = from_timestamp + frame_count
+            buf_from = now
+        else:
+            buf_from = from_timestamp
+        buf_to = buf_from + frame_count
 
         # In loop mode with accelerated time, check if read would exceed jitter tolerance
-        # This prevents user code from advancing time too far ahead
+        # Compare in internal 50kHz space where _loop_deadline_ts lives
         if self._use_accelerated_time and self._in_loop:
-            # Get current deadline_timestamp from shared buffer (set by loop)
-            # If reading beyond deadline would trigger jitter failure, raise TimeoutError
-            if self._loop_deadline_ts is not None and to_timestamp > self._loop_deadline_ts:
+            internal_to = _to_internal_ts(buf_to)
+            if self._loop_deadline_ts is not None and internal_to > self._loop_deadline_ts:
                 raise TimeoutError(
                     f"Read request would exceed loop jitter tolerance "
-                    f"(requested up to {to_timestamp}, deadline is {self._loop_deadline_ts})"
+                    f"(requested up to {buf_to}, deadline is {_to_external_ts(self._loop_deadline_ts)})"
                 )
 
         # The system will allow reading from up to ~ 5 secs in the past (shared buffer size)
-        if from_timestamp < (now - self._shared_buffer.buffer_duration_frames):
-            raise Exception(f"Requested read from past timestamp (from={from_timestamp}, now={now}, buf={self._shared_buffer.buffer_duration_frames}, req={frame_count}) exceeds buffer capacity")
+        if buf_from < (now - self._shared_buffer.buffer_duration_frames):
+            raise Exception(f"Requested read from past timestamp (from={buf_from}, now={now}, buf={self._shared_buffer.buffer_duration_frames}, req={frame_count}) exceeds buffer capacity")
 
         # For large reads in accelerated mode that might exceed buffer capacity,
-        # read in chunks to avoid buffer wraparound issues
+        # read in chunks to avoid buffer wrap around issues
         max_chunk_size = self._shared_buffer.buffer_duration_frames // 2  # Read half buffer at a time
         if self._use_accelerated_time and frame_count > max_chunk_size:
-            result = np.empty((frame_count, self._channel_count), dtype=np.int16)
+            read_frames = np.empty((frame_count, self._channel_count), dtype=np.int16)
+            read_spikes = []
+            read_stims  = []
             chunks_read = 0
 
             while chunks_read < frame_count:
-                chunk_size = min(max_chunk_size, frame_count - chunks_read)
-                chunk_from_ts = from_timestamp + chunks_read
-                chunk_to_ts = chunk_from_ts + chunk_size
+                chunk_size    = min(max_chunk_size, frame_count - chunks_read)
+                chunk_from_ts = buf_from + chunks_read
+                chunk_to_ts   = chunk_from_ts + chunk_size
 
+                # Publish stims before advancing producer so source callbacks are causal.
+                self._publish_stims_to_buffer_until(_to_internal_ts(chunk_to_ts))
                 # Tell producer to advance to this chunk's end
                 # In loop mode, already checked deadline above
                 self._shared_buffer.requested_timestamp = chunk_to_ts
@@ -772,50 +964,124 @@ class Neurons:
 
                 # Read chunk
                 try:
-                    chunk_data = self._shared_buffer.read_frames(chunk_from_ts, chunk_size)
-                    result[chunks_read:chunks_read + chunk_size] = chunk_data
+                    chunk_frames = self._shared_buffer.read_frames(chunk_from_ts, chunk_size)
+                    # Spike/stim reads use internal 50kHz timestamps
+                    internal_chunk_from = _to_internal_ts(chunk_from_ts)
+                    internal_chunk_to   = _to_internal_ts(chunk_to_ts)
+                    chunk_spikes = self._read_spikes(internal_chunk_to - internal_chunk_from, internal_chunk_from)
+                    chunk_stims  = self._read_stims(internal_chunk_from, internal_chunk_to, write_to_buffer=not self._in_loop)
+
+                    read_frames[chunks_read:chunks_read + chunk_size] = chunk_frames
+                    read_spikes.extend(chunk_spikes)
+                    read_stims.extend(chunk_stims)
                 except ValueError as e:
                     raise Exception(f"Failed to read frames at chunk {chunks_read}: {e}") from e
 
                 chunks_read += chunk_size
 
-            read_frames = result
         else:
             # Normal single read for small requests or real-time mode
             # In accelerated mode, tell the producer to advance to the required timestamp
             # In loop mode, deadline check was already done above
             if self._use_accelerated_time:
-                self._shared_buffer.requested_timestamp = to_timestamp
+                self._publish_stims_to_buffer_until(_to_internal_ts(buf_to))
+                self._shared_buffer.requested_timestamp = buf_to
 
             # Wait for data to be available if reading into the future
-            if to_timestamp > now and not self._shared_buffer.wait_for_timestamp(to_timestamp, timeout_seconds=30.0):
-                raise TimeoutError(f"Timeout waiting for timestamp {to_timestamp}")
+            if buf_to > now and not self._shared_buffer.wait_for_timestamp(buf_to, timeout_seconds=30.0):
+                raise TimeoutError(f"Timeout waiting for timestamp {buf_to}")
 
             try:
-                read_frames = self._shared_buffer.read_frames(from_timestamp, frame_count)
+                read_frames = self._shared_buffer.read_frames(buf_from, frame_count)
+                # Spike/stim reads use internal 50kHz timestamps
+                internal_from = _to_internal_ts(buf_from)
+                internal_to   = _to_internal_ts(buf_to)
+                read_spikes = self._read_spikes(internal_to - internal_from, internal_from)
+                read_stims  = self._read_stims(internal_from, internal_to, write_to_buffer=not self._in_loop)
             except ValueError as e:
                 # Data not available - might be too old or not yet produced
                 raise Exception(f"Failed to read frames: {e}") from e
 
-        # Update _elapsed_frames for backward compatibility
-        new_elapsed = to_timestamp - self._start_timestamp
+        # Update _elapsed_frames for backward compatibility (internal 50kHz)
+        new_elapsed = _to_internal_ts(buf_to) - self._start_timestamp
         self._elapsed_frames = max(self._elapsed_frames, new_elapsed)
 
-        # Push samples to all active recordings
-        for recording in self._recordings:
-            recording._write_samples(read_frames)
+        self._read_timestamp = max(self._read_timestamp, _to_internal_ts(buf_to))
 
-        self._read_timestamp = max(self._read_timestamp, to_timestamp)
+        if analysis:
+            # Convert internal timestamps to external 25kHz for user-facing API
+            return DetectionResult(
+                start_timestamp = buf_from,
+                stop_timestamp  = buf_to,
+                spikes          = read_spikes,
+                stims           = read_stims
+                )
+        else:
+            return read_frames
 
+    def _read_loop_frames(
+        self,
+        frame_count: int,
+        from_timestamp: int,
+    ) -> ndarray[tuple[int, int], np.dtype[np.int16]]:
+        """Read loop frames without also materializing analysis."""
+        assert self._shared_buffer is not None
+
+        buf_from = from_timestamp
+        buf_to   = buf_from + frame_count
+        now      = self._shared_buffer.write_timestamp
+
+        if buf_from < (now - self._shared_buffer.buffer_duration_frames):
+            raise Exception(
+                f"Requested read from past timestamp (from={buf_from}, now={now}, "
+                f"buf={self._shared_buffer.buffer_duration_frames}, req={frame_count}) exceeds buffer capacity"
+            )
+
+        if buf_to > now and not self._shared_buffer.wait_for_timestamp(buf_to, timeout_seconds=30.0):
+            raise TimeoutError(f"Timeout waiting for timestamp {buf_to}")
+
+        try:
+            read_frames = self._shared_buffer.read_frames(buf_from, frame_count)
+        except ValueError as e:
+            raise Exception(f"Failed to read frames: {e}") from e
+
+        new_elapsed = _to_internal_ts(buf_to) - self._start_timestamp
+        self._elapsed_frames = max(self._elapsed_frames, new_elapsed)
+        self._read_timestamp = max(self._read_timestamp, _to_internal_ts(buf_to))
         return read_frames
+
+    @overload
+    async def read_async(
+        self,
+        frame_count:    int,
+        from_timestamp: int | None      = None,
+        /,
+        *,
+        analysis:       Literal[False]  = False
+        ) -> ndarray[tuple[int, int], np.dtype[np.int16]]:
+        ...
+
+    @overload
+    async def read_async(
+        self,
+        frame_count:    int,
+        from_timestamp: int | None      = None,
+        /,
+        *,
+        analysis:       Literal[True]
+        ) -> DetectionResult:
+        ...
 
     async def read_async(
         self,
         frame_count:    int,
-        from_timestamp: int | None = None
-        ) -> ndarray[tuple[int, int], np.dtype[np.int16]]:
+        from_timestamp: int | None = None,
+        /,
+        *,
+        analysis:       bool       = False
+        ) -> ndarray[tuple[int, int], np.dtype[np.int16]] | DetectionResult:
         """ Asynchronous version of read(). """
-        return self.read(frame_count, from_timestamp)
+        return self.read(frame_count, from_timestamp, analysis=analysis)
 
     #
     # All non-passive functionality requires that the calling process
@@ -948,25 +1214,9 @@ class Neurons:
         if self.has_started():
             self.stop()
 
-        # Stop WebSocket server subprocess first (it reads from the buffer)
-        self._stop_websocket_server()
-
-        # Stop heartbeat thread
-        self._stop_heartbeat_thread()
-
-        # Stop the data producer subprocess (always, even if not started via has_started)
-        if hasattr(self, '_data_producer') and self._data_producer is not None:
-            self._data_producer.stop()
-            self._data_producer = None
-            self._shared_buffer = None
-            self._producer_started = False
-
         # Stop any recordings
         for recording in self._recordings:
             recording.stop()
-
-        # Close the H5 recording
-        self._replay_file.close()
 
     #
     # Simulator specific functionality, do not use these in your applications.
@@ -975,7 +1225,7 @@ class Neurons:
     _is_running: bool = False
     """ (Simulator only) Indicates the current status. """
 
-    _replay_file: RecordingView
+    _replay_attrs: dict[str, Any] | None = None
     """ (Simulator only) The recording file to replay. """
 
     _replay_start_offset: int
@@ -1008,7 +1258,7 @@ class Neurons:
     _stim_queue: ChannelStimQueue[_StimOp]
     """ (Simulator only) Queued stims to be delivered at specific timestamps. Indexed by channel for efficient interrupt handling. """
 
-    _stim_frequency_bin_duration_us: int = 20
+    _stim_frequency_bin_duration_us: int = _FRAME_TIME_US
     """
     (Simulator only) Duration of the smallest frequency bin for generating stim bursts
     that is supported by the system in microseconds (us).
@@ -1016,9 +1266,6 @@ class Neurons:
 
     _frame_duration_us: int
     """ (Simulator only) Time interval between frames in microseconds (us) based on _frames_per_second. """
-
-    _tick_stims: list[Stim]
-    """ (Simulator only) Record of stims during ticks, will be reset when read. """
 
     _stim_channel_available_from: ndarray[tuple[int], np.dtype[np.int_]]
     """ (Simulator only) Timestamps each channel will be available from. """
@@ -1053,90 +1300,77 @@ class Neurons:
     _app_html: ClassVar[str | None] = None
     """ (Simulator only) HTML for visualisation of an application run. """
 
-    def _advance_elapsed_frames(self, frame_count: int = 0) -> None:
+    _instance: ClassVar[Neurons | None] = None
+    """ (Simulator only) Singleton instance of Neurons for the simulator. """
+
+    @classmethod
+    def _get_instance(cls) -> Neurons:
+        """ (Simulator only) Get the singleton instance of Neurons for the simulator. """
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def _clear_instance(cls, force: bool = False) -> None:
         """
-        (Simulator only) Advances the _elapsed_frames counter one frame at a time to
-        simulate passage of time. We use this opportunity to apply time
-        dependent tasks like performing stims.
+        (Simulator only) Clear the singleton instance of Neurons.
 
-        Args:
-            frame_count: Number of frames to advance. When this is zero and
-                we are in not in accelerated time mode, we will advance the
-                _elapsed_frames by the real passage of time.
+        Refuses to tear down an instance that is currently inside a
+        `cl.open()` / `with Neurons(...)` context, since doing so would pull
+        the running data-producer subprocess out from under any in-flight
+        reads/stims. Pass `force=True` only from process-shutdown hooks
+        (e.g. `atexit`) where the context cannot be exited cleanly.
         """
-        blocking_mode = True
+        if cls._instance is None:
+            return
 
-        if frame_count == 0 and not self._use_accelerated_time:
-            # Here, we allow the frame counter to catch up to wall clock time
-            current_walltime_ns    = time.perf_counter_ns()
-            elapsed_walltime_ns    = current_walltime_ns - self._prev_walltime_ns
-            frame_count            = int(elapsed_walltime_ns * self._frames_per_second / 1e9)
-            blocking_mode          = False
+        instance = cls._instance
+        if instance.has_started() and not force:
+            raise RuntimeError(
+                "Cannot clear the active Neurons instance while inside a "
+                "cl.open()/Neurons context. Exit the context first "
+                "(e.g. leave the `with cl.open() as neurons:` block) before "
+                "reconfiguring the simulator (e.g. via "
+                "cl.sim.set_simulator_data_source / clear_simulator_data_source)."
+            )
 
-        # Advance elapsed_frames iteratively while performing queued stims and/or ops.
-        now              = self._start_timestamp + self._elapsed_frames
-        timestamp_target = now + frame_count
-        stim_queue       = self._stim_queue
-        ops_queue        = self._timed_ops
+        instance.close()
 
-        while now < timestamp_target:
+        # Stop WebSocket server subprocess first (it reads from the buffer)
+        instance._stop_websocket_server()
 
-            # Advance to the timestamp of the next queued stim or operation
-            next_stim_timestamp   = stim_queue.peek_min_timestamp()
-            next_stim_timestamp   = timestamp_target if next_stim_timestamp is None else next_stim_timestamp
-            next_op_timestamp     = timestamp_target if ops_queue.qsize()  < 1 else ops_queue.queue[0][0]
-            next_timestamp        = min(next_stim_timestamp, next_op_timestamp, timestamp_target)
-            self._elapsed_frames += (next_timestamp - now)
-            now                   = next_timestamp
+        # Stop heartbeat thread
+        instance._stop_heartbeat_thread()
 
-            # Perform any stims in the queue up to current timestamp
-            stim_ch_msg: dict[int, list[int]] = defaultdict(list)
-            popped_stims = stim_queue.pop_until(now + 1)  # +1 because pop_until is exclusive
-            for stim_ts, _stim_channel, stim_op in popped_stims:
-                if isinstance(stim_op, _StimOp):
-                    # Push stim to all active recordings
-                    for recording in self._recordings:
-                        recording._write_stims([stim_op.stim])
-                    self._tick_stims.append(stim_op.stim)
-                    stim_ch_msg[stim_ts].append(stim_op.stim.channel)
+        # Stop the data producer subprocess (always, even if not started via has_started)
+        if instance._data_producer is not None:
+            instance._data_producer.stop()
+            instance._data_producer    = None
+            instance._shared_buffer    = None
+            instance._producer_started = False
 
-            # Potentially hot path, so explicitly check to avoid unnecessary overhead
-            if _logger.isEnabledFor(logging.DEBUG) and stim_ch_msg:
-                # This is for a verbose message to let the user know we've performed a stim
-                for stim_ts, stim_chs in stim_ch_msg.items():
-                    _logger.debug("Stim at %d on channels %s", stim_ts, stim_chs)
+        del cls._instance
+        cls._instance = None
 
-            # Perform any operations in the queue
-            while (ops_queue.qsize() > 0):
-                if ops_queue.queue[0][0] > now:
-                    break
-                _, op = ops_queue.get()
-                op()
-
-        # Here, we block the thread for the requested frame_count in wall clock time.
-        if blocking_mode and not self._use_accelerated_time:
-            self._sleep_until(timestamp_target)
-
-        # Update the wall clock time before leaving
-        self._prev_walltime_ns = time.perf_counter_ns()
+        atexit.unregister(cls._clear_instance)
 
     def _sleep_until(self, timestamp: int) -> None:
         """
         (Simulator only) Block the thread until the specified timestamp is reached.
 
         Args:
-            timestamp: wake up the system at this timestamp
+            timestamp: wake up the system at this timestamp (external 25kHz)
         """
         assert self._shared_buffer is not None
 
-        # Calculate how many frames we need to wait
-        current_timestamp = self._shared_buffer.write_timestamp
+        # Calculate how many frames we need to wait (in external 25kHz space)
+        current_timestamp = self.timestamp()
         frames_to_wait    = timestamp - current_timestamp
 
         if frames_to_wait <= 0:
             return  # Already past target timestamp
 
-        wait_secs = frames_to_wait / self._frames_per_second
+        wait_secs = frames_to_wait / _EXTERNAL_FRAMES_PER_SECOND
 
         # We wake up the system earlier with a buffer to increase accuracy
         end = time.perf_counter() + wait_secs
@@ -1156,139 +1390,230 @@ class Neurons:
         (Simulator only) Read spikes from the shared buffer that are found in the next
         frame_count frames, starting at from_timestamp if supplied.
 
+        All parameters are in internal 50kHz timestamps. Returned spikes have
+        timestamps converted to external 25kHz.
+
         Args:
-            frame_count: Number of frames to consider for reading spikes.
-            from_timestamp: Read from a specific timestamp. If None, return
+            frame_count: Number of internal frames to consider for reading spikes.
+            from_timestamp: Read from a specific internal timestamp. If None, return
                 from the current timestamp.
 
         Returns:
             List of spikes found within the given number of frames.
         """
-        # Calculate required timestamps
-        now               = self.timestamp()
+        # Calculate required timestamps (internal 50kHz)
+        now               = self._internal_timestamp()
         from_timestamp    = now if from_timestamp is None else from_timestamp
         to_timestamp      = from_timestamp + frame_count
 
-        # Read from shared buffer
-        if self._shared_buffer is not None:
-            spike_records = self._shared_buffer.read_spikes(from_timestamp, to_timestamp)
-            if not spike_records:
-                return []
-            read_spikes = [
-                Spike(
-                    timestamp           = rec.timestamp,
-                    channel             = rec.channel,
-                    samples             = rec.samples,
-                    channel_mean_sample = rec.channel_mean_sample,
-                )
-                for rec in spike_records
-            ]
-            # Push spikes to all active recordings
-            for recording in self._recordings:
-                recording._write_spikes(read_spikes)
-            return read_spikes
+        # Convert internal 50kHz → buffer 25kHz for the shared buffer read
+        assert self._shared_buffer is not None
+        spike_records = self._shared_buffer.read_spikes(
+            _to_external_ts(from_timestamp), _to_external_ts(to_timestamp)
+        )
+        if not spike_records:
+            return []
 
-        # Fallback to legacy direct replay file access
-        assert self._replay_file.spikes is not None, "Replay file does not contain spikes"
-        replay_spikes = self._replay_file.spikes
-
-        op_timestamp                     = from_timestamp - self._start_timestamp + self._replay_start_offset
-        op_end_timestamp                 = to_timestamp   - self._start_timestamp + self._replay_start_offset
-        start_idx                        = op_timestamp   % self._duration_frames
-        read_spikes      : list[Spike]   = []
-        while op_timestamp < op_end_timestamp:
-            remaining_frames = op_end_timestamp - op_timestamp
-            end_idx          = min(self._duration_frames, start_idx + remaining_frames)
-            for i in replay_spikes.get_where_list(f"(timestamp > {start_idx}) & (timestamp <= {end_idx})"):
-                replay_spike = replay_spikes[i]
-                spike_timestamp = int(
-                    replay_spike["timestamp"]
-                    - start_idx
-                    + op_timestamp
-                    - self._replay_start_offset
-                    + self._start_timestamp
-                    )
-
-                assert spike_timestamp > from_timestamp and spike_timestamp <= to_timestamp
-                read_spikes.append(Spike(
-                    timestamp           = spike_timestamp,
-                    channel             = int(replay_spike["channel"]),
-                    samples             = replay_spike["samples"],
-                    channel_mean_sample = float(replay_spike["samples"].mean())
-                    ))
-
-            op_timestamp += (end_idx - start_idx)
-            start_idx = end_idx % self._duration_frames
-
-        # Push spikes to all active recordings
-        for recording in self._recordings:
-            recording._write_spikes(read_spikes)
+        read_spikes = [
+            Spike(
+                timestamp           = rec.timestamp,
+                channel             = rec.channel,
+                samples             = rec.samples,
+                channel_mean_sample = rec.channel_mean_sample,
+            )
+            for rec in spike_records
+        ]
         return read_spikes
+
+    def _stim_record_from_op(self, stim_op: _StimOp, ext_ts: int) -> StimRecord:
+        phase_durations_us, phase_currents_uA, phase_count = stim_op.stim_design._get_padded()
+        return StimRecord(
+            timestamp          = ext_ts,
+            intended_timestamp = ext_ts,
+            channel            = stim_op.channel,
+            phase_count        = phase_count,
+            phase_durations_us = phase_durations_us,
+            phase_currents_uA  = phase_currents_uA,
+        )
+
+    def _publish_stims_to_buffer_until(self, to_timestamp: int) -> None:
+        """Publish queued stims up to an internal 50 kHz timestamp."""
+        if self._shared_buffer is None:
+            return
+        if to_timestamp <= self._stim_buffer_write_ts:
+            return
+        self._read_stims(
+            self._stim_buffer_write_ts,
+            to_timestamp,
+            write_to_buffer=True,
+        )
 
     def _read_stims(
         self,
-        from_timestamp: int,
-        to_timestamp  : int
+        from_timestamp  : int,
+        to_timestamp    : int,
+        write_to_buffer : bool = False,
         ) -> list[Stim]:
         """
-        (Simulator only) Read stims from the shared buffer within a timestamp range.
+        (Simulator only) Read stims within a timestamp range.
 
-        Args:
-            from_timestamp: Start of range (inclusive).
-            to_timestamp: End of range (exclusive).
+        All parameters and internal state use internal 50kHz timestamps.
+        Returned stims have timestamps converted to external 25kHz.
 
-        Returns:
-            List of stims found within the given timestamp range.
+        When `write_to_buffer` is True, stims whose internal timestamp is at or
+        past `_stim_buffer_write_ts` are written to the shared buffer's stim
+        ring, and the high-water mark advances to prevent double-writes from
+        overlapping `read()` calls.
+
+        Retention: the queue is pruned to match the shared buffer's 5-second
+        ring window so memory stays bounded and backward reads behave
+        consistently with the old shared-buffer implementation.
         """
-        if hasattr(self, '_shared_buffer') and self._shared_buffer is not None:
-            stim_records = self._shared_buffer.read_stims(from_timestamp, to_timestamp)
-            if not stim_records:
+        # Fast path: nothing queued, no rebuild pending. Avoid lock acquire + prune scan
+        # which is otherwise paid every accelerated-loop tick.
+        if (
+            not self._rebuild_pending
+            and self._stim_queue._total_count == 0
+        ):
+            if not write_to_buffer or self._shared_buffer is None:
                 return []
-            read_stims = [
-                Stim(timestamp=rec.timestamp, channel=rec.channel)
-                for rec in stim_records
-            ]
-            # Push stims to all active recordings
-            for recording in self._recordings:
-                recording._write_stims(read_stims)
+            with self._stim_lock:
+                if (
+                    not self._rebuild_pending
+                    and self._stim_queue._total_count == 0
+                ):
+                    ext_to = _to_external_ts(to_timestamp)
+                    if ext_to > self._shared_buffer.stim_write_timestamp:
+                        self._shared_buffer.stim_write_timestamp = ext_to
+                    if to_timestamp > self._stim_buffer_write_ts:
+                        self._stim_buffer_write_ts = to_timestamp
+                    return []
+
+        with self._stim_lock:
+            # If a rebuild was deferred (by interrupt()), run it now — before any
+            # stim data is returned — so that the current plan's stim/sync
+            # operations are included in the mini-sim.
+            if self._rebuild_pending:
+                self._rebuild_pending = False
+                self._rebuild_stim_queue()
+            # Prune stims that have fallen outside the shared buffer's retention window,
+            # and collect the in-range entries — in a single pass over the channel dict.
+            # Buffer timestamps are 25kHz; stim queue timestamps are internal 50kHz.
+            if self._shared_buffer is not None:
+                oldest_valid = _to_internal_ts(self._shared_buffer.write_timestamp - self._shared_buffer.buffer_duration_frames)
+                prune_before = max(oldest_valid, self._start_timestamp)
+            else:
+                prune_before = self._start_timestamp
+
+            # Bound the rebuild-history records even when no rebuild fires. A
+            # rebuild (and the compaction it triggers) only runs for multi-channel
+            # stims or interrupts; a workload of purely single-channel stims would
+            # otherwise grow _stim_op_records / _interrupt_records for the entire
+            # session. Each retained record holds a ChannelSet (a 64-element numpy
+            # array), so unbounded growth leaks memory and steadily lengthens the
+            # main process's gen-2 GC pauses — the gradual slow-down seen over long
+            # sessions. Records older than the ring retention window can never be
+            # the target of a future interrupt-driven rebuild, so pruning them is
+            # safe. Cadenced to once per simulated second to keep per-tick cost
+            # negligible.
+            if (
+                not self._rebuilding
+                and self._stim_op_records
+                and to_timestamp - self._last_history_compact_ts >= self._frames_per_second
+            ):
+                self._last_history_compact_ts = to_timestamp
+                self._compact_stim_history(prune_before)
+
+            entries = self._stim_queue.prune_and_get_range(prune_before, from_timestamp, to_timestamp)
+            if not entries:
+                # Still advance the stim write cursor so the recording process
+                # knows it's safe to read up to this point (no stims to write).
+                if write_to_buffer and self._shared_buffer is not None:
+                    ext_to = _to_external_ts(to_timestamp)
+                    if ext_to > self._shared_buffer.stim_write_timestamp:
+                        self._shared_buffer.stim_write_timestamp = ext_to
+                    if to_timestamp > self._stim_buffer_write_ts:
+                        self._stim_buffer_write_ts = to_timestamp
+                return []
+
+            # Convert internal 50kHz stim timestamps to external 25kHz and
+            # optionally write StimRecords to the shared buffer.
+            read_stims           : list[Stim]       = []
+            stim_records_to_write: list[StimRecord] = []
+            for _ts, _ch, stim_op in entries:
+                if not isinstance(stim_op, _StimOp):
+                    continue
+                ext_ts = _to_external_ts(stim_op.timestamp)
+                read_stims.append(Stim(timestamp=ext_ts, channel=stim_op.channel))
+                if write_to_buffer and self._shared_buffer is not None:
+                    # Only write stims we haven't written before (high-water mark)
+                    if _ts >= self._stim_buffer_write_ts:
+                        stim_records_to_write.append(
+                            self._stim_record_from_op(stim_op, ext_ts)
+                        )
+
+            if stim_records_to_write and self._shared_buffer is not None:
+                self._shared_buffer.write_stims(stim_records_to_write)
+                last_published_ts = max(rec.intended_timestamp for rec in stim_records_to_write)
+                if (
+                    self._last_published_stim_timestamp is None
+                    or last_published_ts > self._last_published_stim_timestamp
+                ):
+                    self._last_published_stim_timestamp = last_published_ts
+
+            # Advance the stim write cursor so the recording process knows
+            # all stims up to this timestamp are in the ring buffer.
+            if write_to_buffer and self._shared_buffer is not None:
+                ext_to = _to_external_ts(to_timestamp)
+                if ext_to > self._shared_buffer.stim_write_timestamp:
+                    self._shared_buffer.stim_write_timestamp = ext_to
+                if to_timestamp > self._stim_buffer_write_ts:
+                    self._stim_buffer_write_ts = to_timestamp
+
             return read_stims
 
-        # Fallback - no stims available without shared buffer
-        return []
-
-    def _read_and_reset_stim_cache(self) -> list[Stim]:
+    def _compute_burst_params(
+        self,
+        stim_duration_us: int,
+        burst_design:     BurstDesign | None,
+    ) -> tuple[BurstDesign, np.ndarray, bool]:
         """
-        (Simulator only) Read stims since the last read and update tracking.
+        (Simulator only) Compute burst timing parameters from stim duration and optional burst design.
 
-        This is the primary interface for getting stims in a loop iteration.
+        Returns:
+            burst_design:        Resolved BurstDesign (original or synthesized single-burst).
+            burst_timestamps:    Array of burst boundary frames relative to stim start.
+            has_trailing_offset: True if final burst has sub-frame remainder.
         """
-        if hasattr(self, '_shared_buffer') and self._shared_buffer is not None:
-            # In a loop, use tick timestamps to avoid skipping stims scheduled
-            # "late" during a tick (when producer is already ahead)
-            if self._in_loop and self._loop_tick_timestamp is not None:
-                # Read stims from last tick to current tick (not to producer position)
-                from_ts = self._last_stim_read_ts
-                to_ts   = self._loop_tick_timestamp         # End of current tick
-                stims   = self._read_stims(from_ts, to_ts)
-                self._last_stim_read_ts = to_ts
-            else:
-                # Non-loop: use producer's write position
-                now   = self.timestamp()
-                stims = self._read_stims(self._last_stim_read_ts, now)
-                self._last_stim_read_ts = now
-            return stims
+        if burst_design is not None:
+            total_burst_duration_us     = (burst_design._burst_count + 1) * burst_design._burst_interval_us
+            burst_times_us              = np.arange(0, total_burst_duration_us, step=burst_design._burst_interval_us)
+            burst_timestamps, remainder = np.divmod(burst_times_us, self._frame_duration_us)
+            has_trailing_offset         = remainder[-1] != 0
+        else:
+            total_stim_duration_us = stim_duration_us + _MINIMUM_LEAD_TIME_US
+            single_burst_hz        = min(1_000_000 / total_stim_duration_us, BurstDesign._BURST_FREQUENCY_LIMIT_HZ)
+            burst_design           = BurstDesign(1, single_burst_hz)
+            burst_timestamps       = np.array([0, burst_design._burst_interval_us // self._frame_duration_us])
+            has_trailing_offset    = False
+        return burst_design, burst_timestamps, has_trailing_offset
 
-        # Fallback to legacy behavior
-        stims = self._tick_stims.copy()
-        self._tick_stims.clear()
-        return stims
+    def _compute_burst_schedule(
+        self,
+        stim_duration_us: int,
+        burst_design:     BurstDesign | None,
+    ) -> tuple[int, int]:
+        """
+        Return the burst count and interval without allocating every boundary
+        timestamp. The rebuild simulator still uses _compute_burst_params().
+        """
+        if burst_design is not None:
+            return burst_design._burst_count, burst_design._burst_interval_us
 
-    def _determine_burst_interval_us(self, frequency_hz: float) -> int:
-        """ (Simulator only) Determines the interval of stims in bursts as microseconds (us). """
-        assert frequency_hz > 0, "Burst frequency must be positive"
-        interval_frames = int((1_000_000 / frequency_hz / self._stim_frequency_bin_duration_us) + 0.5)
-        interval_us     = int(interval_frames * self._stim_frequency_bin_duration_us)
-        return interval_us
+        total_stim_duration_us = stim_duration_us + _MINIMUM_LEAD_TIME_US
+        single_burst_hz        = min(1_000_000 / total_stim_duration_us, BurstDesign._BURST_FREQUENCY_LIMIT_HZ)
+        burst_interval_us      = int((1_000_000 / single_burst_hz / _FRAME_TIME_US) + 0.5) * _FRAME_TIME_US
+        return 1, burst_interval_us
 
     def _queue_stims(
         self,
@@ -1307,17 +1632,28 @@ class Neurons:
         burst_design  : A BurstDesign object specifying the burst count and frequency (default: None).
         lead_time_us  : The lead time in microseconds before the stimulation starts (default: 80).
         """
-        # Check and build ChannelSet
-        if isinstance(channel_set, ChannelSet):
-            pass
-        elif isinstance(channel_set, int):
-            channel_set = ChannelSet(channel_set)
+        if isinstance(channel_set, int):
+            if channel_set < 0 or channel_set >= ChannelSet._CHANNELS_TOTAL:
+                raise ValueError(f"Channel number {channel_set} is out of range")
+            if channel_set in _GROUNDED_CHANNEL_SET:
+                return
+            unfiltered_channels = (channel_set,)
+            stimmable_channels  = (channel_set,)
+        elif isinstance(channel_set, ChannelSet):
+            unfiltered_channels = tuple(channel_set._tolist())
+            stimmable_channels  = tuple(ch for ch in unfiltered_channels if ch not in _GROUNDED_CHANNEL_SET)
+            if not stimmable_channels:
+                return
         else:
             raise ValueError(
                 f"channel_set must be "
                 f"ChannelSet object or an int, "
                 f"not {channel_set.__class__.__name__}"
                 )
+
+        channel_count             = len(stimmable_channels)
+        unfiltered_channel_count  = len(unfiltered_channels)
+        unfiltered_channel_set    = ChannelSet(*unfiltered_channels)
 
         # Check and build StimDesign
         if isinstance(stim_design, StimDesign):
@@ -1332,92 +1668,618 @@ class Neurons:
                 f"not {stim_design.__class__.__name__}"
                 )
 
-        # Check and build BurstDesign
-        if isinstance(burst_design, BurstDesign):
-            pass
-        elif burst_design is None:
-            burst_design = BurstDesign(1, 100)  # burst_hz does not matter for burst of one
-        else:
+        # Check BurstDesign
+        if burst_design is not None and not isinstance(burst_design, BurstDesign):
             raise ValueError(
-                f"burst_design must be "
+                f"burst_design must be a "
                 f"BurstDesign object, "
                 f"not {burst_design.__class__.__name__}"
                 )
 
         # Specify stimulation constraints
-        lead_time_us_bins         = 40
-        minimum_lead_time_us      = 80
-        minimum_lead_time_frames  = int(minimum_lead_time_us / lead_time_us_bins)
-        minimum_burst_interval_us = minimum_lead_time_us + stim_design.duration_us
+        minimum_lead_time_frames  = _MINIMUM_LEAD_TIME_US // _FRAME_TIME_US
+        minimum_burst_interval_us = _MINIMUM_LEAD_TIME_US + stim_design.duration_us
 
         # Check that stimulation constraints have been met
-        if lead_time_us < minimum_lead_time_us:
-            raise ValueError(f"lead_time_us must be at least {minimum_lead_time_us}")
+        if lead_time_us < _MINIMUM_LEAD_TIME_US:
+            raise ValueError(f"lead_time_us must be at least {_MINIMUM_LEAD_TIME_US}")
 
-        if not lead_time_us % lead_time_us_bins == 0:
-            raise ValueError(f"lead_time_us must be evenly divisible by {lead_time_us_bins}")
+        if not lead_time_us % _FRAME_TIME_US == 0:
+            raise ValueError(f"lead_time_us must be evenly divisible by {_FRAME_TIME_US}")
 
-        if burst_design._burst_interval_us < minimum_burst_interval_us:
+        if burst_design is not None and burst_design._burst_interval_us < minimum_burst_interval_us:
             raise ValueError(
                 f"Burst interval {burst_design._burst_interval_us} us "
-                f"must be at least {minimum_lead_time_us} us "
+                f"must be at least {_MINIMUM_LEAD_TIME_US} us "
                 f"+ duration {stim_design.duration_us}"
                 )
 
-        stim_duration_us        = stim_design.duration_us
-        stim_duration_frames    = int(stim_duration_us / 1e6 * self._frames_per_second)
-        lead_time_frames        = int(lead_time_us     / 1e6 * self._frames_per_second)
+        stim_duration_us = stim_design.duration_us
+        lead_time_frames = lead_time_us // self._frame_duration_us
 
-        # Calculate burst intervals
-        # Some frequencies can have a slightly longer interval due to how it lines up
-        # with the frequency bins, i.e. 96 Hz will have interval frames as [260, 261, 260, 261 ...]
-        burst_interval_us           = self._determine_burst_interval_us(burst_design._burst_requested_hz)
-        total_burst_duration_us     = burst_design._burst_count * burst_interval_us
-        burst_times_us              = np.arange(0, total_burst_duration_us, step=burst_interval_us)
-        burst_timestamps, remainder = np.divmod(burst_times_us, self._frame_duration_us)
-        burst_timestamps           += lead_time_frames
-        has_trailing_offset         = remainder[-1] != 0
+        with self._stim_lock:
+            # Record this operation for potential rebuild-on-interrupt.
+            # Store the original (unfiltered) channel_set so the rebuild can add
+            # sync opcodes for grounded channels, matching the reference simulator
+            # which adds syncs for ALL channels but only stim ops for stimmable ones.
+            if not self._rebuilding:
+                if unfiltered_channel_count > 1:
+                    self._stim_history_has_rebuild_ops = True
+                    self._rebuild_affected_channels.update(unfiltered_channels)
+                self._stim_op_records.append(_StimOpRecord(
+                    from_timestamp = from_timestamp,
+                    channel_set    = unfiltered_channel_set,
+                    stim_design    = stim_design,
+                    burst_design   = burst_design,
+                    lead_time_us   = lead_time_us,
+                ))
 
-        for stim_channel in channel_set._iterate_channels():
-            free_ts                  = self._stim_channel_available_from[stim_channel]
-            is_available             = from_timestamp > free_ts
-            start_offset             = from_timestamp if is_available else free_ts
-            channel_burst_timestamps = burst_timestamps + start_offset
-            for i, stim_start_ts in enumerate(channel_burst_timestamps):
-                stim_end_ts       = stim_start_ts + stim_duration_frames
-                next_available_ts = stim_end_ts
+            burst_count, burst_interval_us = self._compute_burst_schedule(stim_duration_us, burst_design)
 
-                if i < burst_design._burst_count - 1:
-                    # Add a delay if we are in a middle of a burst, which is
-                    # equivalent to a direct swap should a new stim command
-                    # be called immediately following interrupt. In this case,
-                    # minimum lead time need to be subtracted.
-                    next_available_ts = channel_burst_timestamps[i + 1] - minimum_lead_time_frames
+            # If channel_set has more than one channel, insert a sync() before the stims.
+            # Use from_timestamp (the plan's timestamp) for the sync lower bound, rather than
+            # the current wall-clock time.
+            if channel_count > 1:
+                self._sync_channels(from_timestamp, ChannelSet(*stimmable_channels), record=False)
 
-                elif i == burst_design._burst_count - 1 and has_trailing_offset:
-                    # Add an extra frame due to frequency bin alignment
-                    next_available_ts += 1
+            for stim_channel in stimmable_channels:
+                free_ts                  = self._stim_channel_available_from[stim_channel]
+                is_available             = from_timestamp > free_ts
+                start_offset             = (from_timestamp if is_available else free_ts) + lead_time_frames
+                next_available_ts        = int(free_ts)
+                queued_stims: list[tuple[int, _StimOp]] = []
+                for i in range(burst_count):
+                    stim_start_ts = start_offset + (i * burst_interval_us) // self._frame_duration_us
+                    # Add a delay if we are in a burst, which is equivalent to a
+                    # direct swap should a new stim command be called immediately
+                    # following interrupt. The minimum lead time is subtracted.
+                    next_available_ts = (
+                        start_offset
+                        + ((i + 1) * burst_interval_us) // self._frame_duration_us
+                        - minimum_lead_time_frames
+                    )
 
-                self._stim_queue.put(
-                    timestamp = stim_start_ts,
-                    channel   = stim_channel,
-                    payload   = _StimOp(
-                        stim          = Stim(timestamp=stim_start_ts, channel=stim_channel),
-                        end_timestamp = next_available_ts
-                    ),
-                )
+                    queued_stims.append((
+                        stim_start_ts,
+                        _StimOp(
+                            timestamp     = stim_start_ts,
+                            channel       = stim_channel,
+                            end_timestamp = next_available_ts,
+                            stim_design   = stim_design,
+                        ),
+                    ))
+
+                if queued_stims:
+                    self._stim_queue.put_many_sorted(stim_channel, queued_stims)
 
                 # We mark the channel busy from the stim timestamp for the
                 # amount of time it takes to perform the stim
                 self._stim_channel_available_from[stim_channel] = next_available_ts
 
-                # Send stim command to the data producer subprocess
-                if hasattr(self, '_data_producer') and self._data_producer is not None:
-                    self._data_producer.queue_stim(
-                        timestamp     = int(stim_start_ts),
-                        channel       = int(stim_channel),
-                        end_timestamp = int(next_available_ts),
-                    )
+        self._notify_stim_publisher()
+
+    def _compact_stim_history(self, prune_before: int) -> None:
+        """
+        Prune stim-op and interrupt records whose outputs have been consumed.
+
+        After each rebuild the stim queue reflects all operations to date, so
+        records whose from_timestamp is older than the ring-buffer retention
+        window are no longer needed for future rebuilds. Pruning bounds the
+        list lengths to ~(event_rate × window_seconds) regardless of how long
+        the simulation runs, eliminating the O(N^2) rebuild-scan growth.
+
+        Saves the current channel-availability snapshot as a checkpoint so the
+        next rebuild can start from the post-prune state instead of _start_timestamp.
+
+        Constraints:
+        - Must only be called while holding _stim_lock.
+        - Must only be called immediately after _rebuild_stim_queue() completes,
+          so _stim_channel_available_from reflects the current rebuilt state.
+        - prune_before must be <= current simulation timestamp.
+        """
+        n_pruned = 0
+        for record in self._stim_op_records:
+            if record.from_timestamp < prune_before:
+                n_pruned += 1
+            else:
+                break  # records are in chronological append order
+
+        if n_pruned == 0:
+            return
+
+        # Save the post-rebuild availability as the new starting point for
+        # future rebuilds, but clamp each channel to prune_before. The retained
+        # records (from_timestamp >= prune_before) are re-simulated on top of
+        # this checkpoint by the next rebuild; if the checkpoint still carried
+        # their cumulative availability, those records would be applied twice and
+        # the inflated floor would drag a not-yet-published burst forward past
+        # the publish head, re-writing it as a "phantom" duplicate. Clamping to
+        # prune_before keeps only the pruned records' contribution: any retained
+        # op (and any interrupt at/after prune_before) re-establishes the correct
+        # availability during re-simulation, while present-time operations are
+        # unaffected because they always start after prune_before.
+        self._rebuild_checkpoint_avail = np.minimum(
+            self._stim_channel_available_from, prune_before
+        )
+
+        del self._stim_op_records[:n_pruned]
+
+        # Drop interrupt records older than prune_before and re-index the rest.
+        # All retained records have from_timestamp >= prune_before and therefore
+        # stim_op_index >= n_pruned, so subtracting n_pruned gives a valid
+        # non-negative index into the pruned list.
+        self._interrupt_records = [
+            (ts, chs, max(0, idx - n_pruned))
+            for ts, chs, idx in self._interrupt_records
+            if ts >= prune_before
+        ]
+        _logger.debug(
+            "_compact_stim_history: pruned %d ops, %d interrupt records remain",
+            n_pruned,
+            len(self._interrupt_records),
+        )
+
+    def _rebuild_stim_queue(self) -> None:
+        """
+        (Simulator only) Rebuild the stim queue by simulating per-channel opcode
+        queues with shared sync barriers, matching the reference simulator's lazy
+        barrier resolution semantics.
+
+        This is called after an interrupt changes a channel's availability,
+        which may invalidate sync timestamps that were eagerly resolved.
+        """
+        # Phase 1: Determine which channels are affected and build their opcode queues
+        channel_queues, interrupt_opcodes, affected_chs = self._build_rebuild_opcodes()
+
+        if not affected_chs:
+            # No channels affected — nothing to rebuild
+            return
+
+        # Phase 2: Event-driven simulation only on affected channels
+        result_stims, ch_completed_at = self._run_rebuild_simulation(
+            channel_queues, interrupt_opcodes, affected_chs
+        )
+
+        # Phase 3: Queue computed stims and sync data producer — only for affected channels
+        _checkpoint = self._rebuild_checkpoint_avail
+        for ch in affected_chs:
+            stim_list = self._stim_queue._channel_stims.get(ch)
+            if stim_list:
+                self._stim_queue._total_count -= len(stim_list)
+                self._stim_queue._channel_stims[ch] = []
+            # Use checkpoint as the starting floor so the simulation result is
+            # interpreted relative to the state captured after the last prune,
+            # not relative to the very beginning of the session.
+            self._stim_channel_available_from[ch] = (
+                int(_checkpoint[ch]) if _checkpoint is not None else self._start_timestamp
+            )
+
+        result_stims.sort(key=lambda item: (item[0], item[1], item[2]))
+        for stim_start_ts, channel, next_available_ts, stim_design in result_stims:
+            self._stim_queue.put_sorted(
+                timestamp = stim_start_ts,
+                channel   = channel,
+                payload   = _StimOp(
+                    timestamp     = stim_start_ts,
+                    channel       = channel,
+                    end_timestamp = next_available_ts,
+                    stim_design   = stim_design,
+                ),
+            )
+            self._stim_channel_available_from[channel] = max(
+                self._stim_channel_available_from[channel],
+                next_available_ts,
+            )
+
+        for ch in affected_chs:
+            self._stim_channel_available_from[ch] = max(
+                self._stim_channel_available_from[ch],
+                ch_completed_at[ch],
+            )
+
+        # Compact history: prune records that are now behind the ring buffer's
+        # retention window and save a checkpoint so the next rebuild can start
+        # from the post-prune availability state instead of _start_timestamp.
+        if self._shared_buffer is not None:
+            _oldest_valid = _to_internal_ts(
+                self._shared_buffer.write_timestamp - self._shared_buffer.buffer_duration_frames
+            )
+            _prune_before = max(_oldest_valid, self._start_timestamp)
+            self._compact_stim_history(_prune_before)
+        else:
+            # No shared buffer (unit tests / offline use) — just save the
+            # checkpoint without pruning so future rebuilds use it as the floor.
+            self._rebuild_checkpoint_avail = self._stim_channel_available_from.copy()
+
+        # After a rebuild all sync barriers have been resolved — the queue now
+        # contains stims at definite timestamps.  Future single-channel
+        # interrupts only replace individual stim entries and cannot break a
+        # sync barrier, so they do not need a rebuild.  Clearing the set
+        # prevents high-frequency single-channel stim updates (rate encoding)
+        # on channels that ALSO appear in multi-channel feedback operations
+        # from triggering a rebuild every tick.  The set is repopulated by
+        # _queue_stims() / _sync_channels() when the next multi-channel
+        # operation is submitted.
+        self._rebuild_affected_channels.clear()
+
+    def _get_affected_channels(self) -> set[int]:
+        """
+        Determine which channels are affected by recorded interrupts.
+
+        A channel is affected if it is directly interrupted, or if it participates
+        in an operation (stim, sync) that shares channels with a directly or
+        transitively affected channel. This is a transitive closure over shared
+        operations.
+        """
+        # Start with directly interrupted channels, but only those that
+        # participate in sync/multi-channel operations.  Interrupts on channels
+        # that have never been part of such operations are fully handled by the
+        # direct stim queue modification in _interrupt_queued_stims() and do
+        # not need rebuild processing.  Including them here would pull all
+        # their stim records into the rebuild, degrading performance over time
+        # (e.g. high-frequency single-channel stim updates in rate encoding).
+        dirty: set[int] = set()
+        for _, int_channels, _ in self._interrupt_records:
+            dirty.update(ch for ch in int_channels if ch in self._rebuild_affected_channels)
+
+        if not dirty and self._stim_history_has_rebuild_ops:
+            for record in self._stim_op_records:
+                channels = record.channel_set._tolist()
+                if isinstance(record, _SyncOpRecord) or len(channels) > 1:
+                    dirty.update(channels)
+
+        if not dirty:
+            return dirty
+
+        # Expand through operations that share channels with dirty set
+        # Each operation's channel set is a group — if any member is dirty, all are dirty
+        op_channel_groups: list[set[int]] = []
+        for record in self._stim_op_records:
+            op_channel_groups.append(set(record.channel_set._tolist()))
+
+        # Transitive closure: keep expanding until stable
+        changed = True
+        while changed:
+            changed = False
+            for group in op_channel_groups:
+                if group & dirty and not group <= dirty:
+                    dirty   |= group
+                    changed  = True
+
+        return dirty
+
+    def _build_rebuild_opcodes(self) -> tuple[list[deque], list[_RebuildInterrupt], set[int]]:
+        """
+        Phase 1 of stim queue rebuild: build per-channel opcode queues from
+        recorded stim operations and interrupt records.
+
+        Only builds queues for affected channels (those directly or transitively
+        connected to interrupted channels via shared operations).
+
+        Returns:
+            channel_queues:    per-channel opcode deques (only populated for affected channels)
+            interrupt_opcodes: list of interrupt opcodes
+            affected_chs:      set of channel indices that need rebuilding
+        """
+        affected_chs = self._get_affected_channels()
+
+        channel_queues   : list[deque]             = [deque() for _ in range(64)]
+        interrupt_opcodes: list[_RebuildInterrupt] = []
+
+        if not affected_chs:
+            return channel_queues, interrupt_opcodes, affected_chs
+
+        interrupt_iter = iter(self._interrupt_records)
+        next_int       = next(interrupt_iter, None)
+
+        prev_from_ts   : dict[int, int | None] = {}
+        current_plan_ts: int | None            = None
+
+        for op_idx, record in enumerate(self._stim_op_records):
+            # Insert any interrupts that fire before this operation
+            while next_int is not None and next_int[2] <= op_idx:
+                int_from_ts, int_channels, _ = next_int
+                # Only create interrupt opcodes for channels in the affected set.
+                # Non-affected channel interrupts are handled directly by
+                # _interrupt_queued_stims() and don't need rebuild simulation.
+                # Including them would cause Phase 2 to visit every interrupt
+                # timestamp, re-processing sync-blocked channels at each one.
+                affected_int_chs = set(ch for ch in int_channels if ch in affected_chs)
+                if affected_int_chs:
+                    int_opcode = _RebuildInterrupt(int_from_ts, affected_int_chs)
+                    interrupt_opcodes.append(int_opcode)
+                    for ch in affected_int_chs:
+                        if prev_from_ts.get(ch) != int_from_ts:
+                            channel_queues[ch].append(_RebuildWaitUntil(int_from_ts))
+                            prev_from_ts[ch] = int_from_ts
+                        channel_queues[ch].append(int_opcode)
+                current_plan_ts = int_from_ts
+                next_int        = next(interrupt_iter, None)
+
+            channels = record.channel_set._tolist()
+
+            # Skip operations that don't involve any affected channel
+            if not any(ch in affected_chs for ch in channels):
+                continue
+
+            effective_from = max(current_plan_ts, record.from_timestamp) if current_plan_ts is not None else record.from_timestamp
+            for ch in channels:
+                if ch not in affected_chs:
+                    continue
+                if prev_from_ts.get(ch) != effective_from:
+                    channel_queues[ch].append(_RebuildWaitUntil(effective_from))
+                    prev_from_ts[ch] = effective_from
+
+            if isinstance(record, _SyncOpRecord):
+                affected_in_sync = [ch for ch in channels if ch in affected_chs]
+                sync_op = _RebuildSync(len(affected_in_sync))
+                for ch in affected_in_sync:
+                    channel_queues[ch].append(sync_op)
+            else:
+                self._append_rebuild_stim_ops(channel_queues, channels, record, affected_chs)
+
+        # Insert any remaining interrupts
+        while next_int is not None:
+            int_from_ts, int_channels, _ = next_int
+            affected_int_chs = set(ch for ch in int_channels if ch in affected_chs)
+            if affected_int_chs:
+                int_opcode = _RebuildInterrupt(int_from_ts, affected_int_chs)
+                interrupt_opcodes.append(int_opcode)
+                for ch in affected_int_chs:
+                    if prev_from_ts.get(ch) != int_from_ts:
+                        channel_queues[ch].append(_RebuildWaitUntil(int_from_ts))
+                        prev_from_ts[ch] = int_from_ts
+                    channel_queues[ch].append(int_opcode)
+            next_int = next(interrupt_iter, None)
+
+        return channel_queues, interrupt_opcodes, affected_chs
+
+    def _append_rebuild_stim_ops(
+        self,
+        channel_queues: list[deque],
+        channels:       list[int],
+        record:         _StimOpRecord,
+        affected_chs:   set[int],
+    ) -> None:
+        """Append stim opcodes to per-channel queues for a single stim operation record."""
+        stim_duration_us     = record.stim_design.duration_us
+        stim_duration_frames = (stim_duration_us // self._frame_duration_us // _INTERNAL_RATE_MULTIPLIER) * _INTERNAL_RATE_MULTIPLIER
+        lead_time_frames     = record.lead_time_us // self._frame_duration_us
+
+        burst_design, burst_timestamps, _ = self._compute_burst_params(
+            stim_duration_us, record.burst_design
+        )
+        burst_count = burst_design._burst_count
+
+        # Multi-channel stim → implicit sync for ALL affected channels (including
+        # grounded), matching the reference simulator which adds a sync
+        # to every channel but only adds stim ops to stimmable ones.
+        affected_in_op = [ch for ch in channels if ch in affected_chs]
+        if len(channels) > 1 and affected_in_op:
+            sync_op = _RebuildSync(len(affected_in_op))
+            for ch in affected_in_op:
+                channel_queues[ch].append(sync_op)
+
+        # Stim ops only for stimmable (non-grounded) affected channels
+        stimmable_channels = [ch for ch in channels if ch not in _GROUNDED_CHANNEL_SET and ch in affected_chs]
+        lead_delay_steps   = lead_time_frames - _NOTICE_STEPS
+        burst_period_steps = int(burst_timestamps[1] - burst_timestamps[0])
+        _notice = _RebuildStimNotice()  # reuse single instance
+        for ch in stimmable_channels:
+            if lead_delay_steps > 0:
+                channel_queues[ch].append(_RebuildDelay(lead_delay_steps))
+
+            for _ in range(burst_count):
+                channel_queues[ch].append(_notice)
+                channel_queues[ch].append(_RebuildStim(
+                    duration_steps = burst_period_steps - _NOTICE_STEPS,
+                    stim_duration  = stim_duration_frames,
+                    channel        = ch,
+                    stim_design    = record.stim_design,
+                ))
+
+    def _run_rebuild_simulation(
+        self,
+        channel_queues:    list[deque],
+        interrupt_opcodes: list[_RebuildInterrupt],
+        affected_chs:      set[int],
+    ) -> tuple[list[tuple[int, int, int, StimDesign]], list[int]]:
+        """
+        Phase 2 of stim queue rebuild: event-driven simulation of per-channel
+        opcode queues with shared sync barriers.
+
+        Uses a min-heap to advance directly to the next active time step,
+        skipping idle channels.  Sync-blocked channels are re-checked each
+        step until their barrier resolves.
+
+        Only simulates channels in affected_chs.
+
+        Returns:
+            result_stims:    list of (stim_start_ts, channel, next_available_ts)
+            ch_completed_at: per-channel final timeline position
+        """
+        start_ts   = self._start_timestamp
+        _checkpoint = self._rebuild_checkpoint_avail
+
+        # If a checkpoint exists (post-prune availability snapshot), start each
+        # channel's timeline from the checkpoint rather than _start_timestamp.
+        # This is equivalent to re-simulating from scratch because the checkpoint
+        # was saved immediately after the previous full rebuild.
+        ch_completed_at = [
+            int(_checkpoint[ch]) if _checkpoint is not None else start_ts
+            for ch in range(64)
+        ]
+        ch_can_int      = [True]  * 64
+
+        ch_int_to:      list[_RebuildInterrupt | None] = [None] * 64
+        ch_active_sync: list[_RebuildSync      | None] = [None] * 64
+
+        result_stims: list[tuple[int, int, int, StimDesign]] = []
+
+        # Build interrupt index: timestamp → list of (index, opcode)
+        interrupt_at_ts: defaultdict[int, list[tuple[int, _RebuildInterrupt]]] = defaultdict(list)
+        for idx, int_op in enumerate(interrupt_opcodes):
+            interrupt_at_ts[int_op.time_step].append((idx, int_op))
+        fired_interrupts: set[int] = set()
+
+        # Sorted unique interrupt timestamps for advancing time
+        sorted_int_ts = sorted(set(int_op.time_step for int_op in interrupt_opcodes))
+        int_ptr = 0
+
+        # -- Event scheduling --
+        # ch_wake[ch] tracks the channel's current state:
+        #   >= 0:  scheduled to wake at that time step
+        #   _CHANNEL_COMPLETE (-1): finished all opcodes
+        #   _SYNC_ACTIVE (-2):     blocked on a sync barrier
+        ch_wake     : list[int]             = [_CHANNEL_COMPLETE] * 64
+        event_heap  : list[tuple[int, int]] = []
+        sync_blocked: set[int]              = set()
+
+        for ch in affected_chs:
+            if channel_queues[ch]:
+                ch_start    = ch_completed_at[ch]  # checkpoint floor or start_ts
+                ch_wake[ch] = ch_start
+                heapq.heappush(event_heap, (ch_start, ch))
+
+        # -- Inner helpers (closures over simulation state) --
+
+        def process_oob(ch: int, time_step: int) -> int | None:
+            queue = channel_queues[ch]
+            new_ts: int | None = None
+
+            if ch_int_to[ch] is not None and ch_can_int[ch]:
+                target = ch_int_to[ch]
+                while queue:
+                    opcode = queue.popleft()
+                    if opcode is target:
+                        ch_int_to[ch]      = None
+                        ch_active_sync[ch] = None
+                        new_ts             = time_step
+                        break
+                    if isinstance(opcode, _RebuildSync):
+                        opcode.channel_count -= 1
+
+            while queue:
+                front = queue[0]
+                match front:
+                    case _RebuildSync():
+                        queue.popleft()
+                        front.channel_count -= 1
+                        ch_active_sync[ch]   = front
+                    case _RebuildWaitUntil():
+                        queue.popleft()
+                        if front.time_step > time_step:
+                            return front.time_step
+                    case _:
+                        break
+
+            return new_ts
+
+        def step_ch(ch: int, time_step: int) -> tuple[int, _RebuildStim | None]:
+            queue = channel_queues[ch]
+
+            if (sync := ch_active_sync[ch]) is not None:
+                if sync.channel_count > 0:
+                    return _SYNC_ACTIVE, None
+                ch_active_sync[ch] = None
+
+            if not queue:
+                ch_completed_at[ch] = time_step
+                return _CHANNEL_COMPLETE, None
+
+            opcode = queue.popleft()
+            ch_can_int[ch] = False
+
+            match opcode:
+                case _RebuildStimNotice():
+                    return time_step + _NOTICE_STEPS, None
+                case _RebuildStim():
+                    ch_can_int[ch] = True
+                    return time_step + opcode.duration_steps, opcode
+                case _RebuildDelay():
+                    ch_can_int[ch] = True
+                    return time_step + opcode.duration_steps, None
+                case _:
+                    raise ValueError(f"Unexpected opcode in step: {opcode}")
+
+        # -- Main simulation loop --
+        prev_time_step = start_ts - 1
+
+        while True:
+            # Purge stale heap entries (from channels that were rescheduled)
+            while event_heap and ch_wake[event_heap[0][1]] != event_heap[0][0]:
+                heapq.heappop(event_heap)
+
+            # Determine next time step from heap and unfired interrupts
+            heap_ts = event_heap[0][0] if event_heap else None
+
+            while int_ptr < len(sorted_int_ts) and sorted_int_ts[int_ptr] <= prev_time_step:
+                int_ptr += 1
+            next_int_ts = sorted_int_ts[int_ptr] if int_ptr < len(sorted_int_ts) else None
+
+            candidates = [t for t in (heap_ts, next_int_ts) if t is not None]
+            if not candidates:
+                break
+
+            time_step      = min(candidates)
+            prev_time_step = time_step
+
+            # Pop all channels waking at this time step
+            active: list[int] = []
+            while event_heap and event_heap[0][0] == time_step:
+                _, ch = heapq.heappop(event_heap)
+                if ch_wake[ch] == time_step:
+                    active.append(ch)
+
+            # Fire interrupts at this time step
+            if time_step in interrupt_at_ts:
+                for idx, int_op in interrupt_at_ts[time_step]:
+                    if idx not in fired_interrupts:
+                        fired_interrupts.add(idx)
+                        for ch in int_op.channels:
+                            if ch in affected_chs:
+                                ch_int_to[ch] = int_op
+
+            # Channels to process: heap-woken + sync-blocked
+            process_chs = active + list(sync_blocked)
+
+            # -- OOB pass --
+            oob_deferred: set[int] = set()
+            for ch in process_chs:
+                new_nts = process_oob(ch, time_step)
+                if new_nts is not None and new_nts > time_step:
+                    oob_deferred.add(ch)
+                    sync_blocked.discard(ch)
+                    ch_wake[ch] = new_nts
+                    heapq.heappush(event_heap, (new_nts, ch))
+
+            # -- Step pass --
+            new_sync: set[int] = set()
+            for ch in process_chs:
+                if ch in oob_deferred:
+                    continue
+
+                new_nts, stim_op = step_ch(ch, time_step)
+                if stim_op is not None:
+                    result_stims.append((
+                        time_step,
+                        stim_op.channel,
+                        time_step + stim_op.duration_steps,
+                        stim_op.stim_design,
+                    ))
+
+                if new_nts == _SYNC_ACTIVE:
+                    ch_wake[ch] = _SYNC_ACTIVE
+                    new_sync.add(ch)
+                elif new_nts == _CHANNEL_COMPLETE:
+                    ch_wake[ch] = _CHANNEL_COMPLETE
+                else:
+                    ch_wake[ch] = new_nts
+                    heapq.heappush(event_heap, (new_nts, ch))
+
+            sync_blocked = new_sync
+
+        return result_stims, ch_completed_at
 
     def _interrupt_queued_stims(
         self,
@@ -1444,55 +2306,91 @@ class Neurons:
 
         interrupt_channels = channel_set._tolist()
 
-        # Before removing stims, get the last kept stim's end timestamp for each channel
-        # This preserves channel availability info needed for sync()
-        for channel in interrupt_channels:
-            last_kept = self._stim_queue.get_last_entry_before(channel, from_timestamp)
-            if last_kept is not None:
-                _, stim_op = last_kept
-                # Use the end timestamp of the last kept stim
-                self._stim_channel_available_from[channel] = stim_op.end_timestamp
-            else:
-                # No stims kept, channel is available at interrupt time
-                self._stim_channel_available_from[channel] = from_timestamp
+        with self._stim_lock:
+            # Record this interrupt for rebuild, but only after stim operations
+            # have been queued (skip setup/reset interrupts that clear channels
+            # before any stim operations exist).
+            # Store the current stim_op_records length so the rebuild can interleave
+            # this interrupt at the correct position relative to stim operations.
+            if not self._rebuilding and self._stim_op_records:
+                self._interrupt_records.append((from_timestamp, interrupt_channels, len(self._stim_op_records)))
 
-        # Use efficient channel-indexed removal: O(c * log k) instead of O(n) drain-rebuild
-        # This removes stims at or after from_timestamp for the specified channels
-        self._stim_queue.interrupt_channels(interrupt_channels, from_timestamp)
+            # Before removing stims, get the last kept stim's end timestamp for each channel
+            for channel in interrupt_channels:
+                last_kept = self._stim_queue.get_last_entry_before(channel, from_timestamp)
+                if last_kept is not None:
+                    _, stim_op = last_kept
+                    self._stim_channel_available_from[channel] = stim_op.end_timestamp
+                else:
+                    self._stim_channel_available_from[channel] = from_timestamp
 
-        # Send interrupt command to the data producer subprocess
-        if hasattr(self, '_data_producer') and self._data_producer is not None:
-            self._data_producer.interrupt_channels(
-                timestamp = from_timestamp,
-                channels  = interrupt_channels,
-            )
+            # Remove stims at or after from_timestamp for the specified channels
+            self._stim_queue.interrupt_channels(interrupt_channels, from_timestamp, return_removed=False)
+
+            # Defer the rebuild until the next read() so that all stim/sync
+            # operations from the current plan are included.  This allows the
+            # mini-sim to process consecutive syncs in a single pass, matching
+            # the reference simulator which consumes sequences of OpcodeSync
+            # opcodes as a batch and only blocks the channel on the last one.
+            #
+            # The rebuild is only needed when sync operations or multi-channel
+            # stims exist — these can have eagerly-resolved timestamps that
+            # become invalid after an interrupt changes channel availability.
+            # For simple single-channel stims, _queue_stims places stims
+            # correctly using real-time availability, so no rebuild is needed.
+            if not self._rebuilding and self._stim_op_records and self._stim_history_has_rebuild_ops:
+                if self._rebuild_affected_channels & set(interrupt_channels):
+                    self._rebuild_pending = True
+        self._notify_stim_publisher()
 
     def _sync_channels(
         self,
-        from_timestamp:       int,
-        channel_set:          ChannelSet,
+        from_timestamp: int,
+        channel_set   : ChannelSet,
         /,
-        wait_for_frame_start: bool        = True
+        record        : bool = True
         ) -> None:
         """
         (Simulator only) Align channel availability to a common timestamp, which is
         the latest (maximum) availability timestamp of the specified channels.
 
         Args:
-            from_timestamp:         Timestamp after which sync should be performed.
-            channel_set:            One or more channels to sync.
-            wait_for_frame_start:   Whether to wait for the next frame start before continuing.
-                                    This has no effect in mock, since only full-frames are used.
+            from_timestamp: Timestamp after which sync should be performed.
+            channel_set:    One or more channels to sync.
+            record:         Whether to record this sync operation for rebuild.
         """
-        sync_channels  = np.array(channel_set._tolist())
-        sync_timestamp = max(self._stim_channel_available_from[sync_channels].max(), from_timestamp)
-        self._stim_channel_available_from[sync_channels] = sync_timestamp
+        with self._stim_lock:
+            # Record standalone sync operations for rebuild.  Syncs that are
+            # implicit within multi-channel stims (_queue_stims) pass _record=False
+            # because they are captured by the _StimOpRecord instead.
+            if record and not self._rebuilding:
+                self._stim_history_has_rebuild_ops = True
+                self._rebuild_affected_channels.update(channel_set._tolist())
+                self._stim_op_records.append(_SyncOpRecord(
+                    from_timestamp = from_timestamp,
+                    channel_set    = channel_set,
+                ))
+            sync_channels  = channel_set._tolist()
+
+            # Find the max availability timestamp across the channels to sync, but only include channels within sync_channels that have stims scheduled
+            sync_timestamp = from_timestamp
+
+            for ch in sync_channels:
+                if self._stim_queue.get_last_timestamp_for_channel(ch) is not None:
+                    available = int(self._stim_channel_available_from[ch])
+                    if available > sync_timestamp:
+                        sync_timestamp = available
+
+            for ch in sync_channels:
+                self._stim_channel_available_from[ch] = sync_timestamp
+
+            self._stim_channel_available_from[sync_channels] = sync_timestamp
 
     def _start_heartbeat_thread(self) -> None:
         """
         (Simulator only) Start background thread that continuously updates heartbeat.
 
-        This thread runs every 50ms to update the heartbeat timestamp in shared memory.
+        This thread updates the heartbeat timestamp and publishes due stim events.
         When the debugger pauses the process, this thread also pauses, causing the
         heartbeat to go stale and triggering subprocesses to pause.
         """
@@ -1500,6 +2398,7 @@ class Neurons:
             return  # Already running
 
         self._heartbeat_stop_event = Event()
+        self._stim_publish_event.clear()
         self._heartbeat_thread     = Thread(
             target = self._heartbeat_loop,
             daemon = True,
@@ -1513,16 +2412,17 @@ class Neurons:
             return
 
         self._heartbeat_stop_event.set()
+        self._stim_publish_event.set()
         if self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=0.5)
-        self._heartbeat_thread = None
+        self._heartbeat_thread     = None
         self._heartbeat_stop_event = None
 
     def _heartbeat_loop(self) -> None:
         """
         (Simulator only) Background thread loop that updates heartbeat timestamp.
 
-        Runs every 50ms to keep the heartbeat fresh. When the debugger pauses
+        Runs periodically to keep the heartbeat fresh. When the debugger pauses
         the process, this thread also pauses, causing the heartbeat to become stale.
         """
         if self._heartbeat_stop_event is None:
@@ -1530,19 +2430,126 @@ class Neurons:
 
         while not self._heartbeat_stop_event.is_set():
             try:
-                if hasattr(self, '_shared_buffer') and self._shared_buffer is not None:
+                if self._shared_buffer is not None:
                     self._shared_buffer.main_process_heartbeat_ns = time.perf_counter_ns()
+                    # The loop owns stim publication while it is active so
+                    # realtime consumers never see half-settled tick updates.
+                    if not self._in_loop:
+                        self._publish_due_stims_to_buffer()
             except Exception:
+                _logger.exception("Error in heartbeat loop")
                 pass  # Ignore errors in background thread
 
-            # Sleep for 50ms (updates heartbeat at 20Hz)
-            self._heartbeat_stop_event.wait(timeout=0.05)
+            self._stim_publish_event.clear()
+            wait_s = self._stim_publish_wait_interval()
+            self._stim_publish_event.wait(timeout=wait_s)
+
+    def _publish_due_stims_to_buffer(self) -> None:
+        """Publish queued stims that are due according to the shared buffer clock."""
+        if self._shared_buffer is None:
+            return
+
+        self._publish_stims_to_buffer_until(_to_internal_ts(self._shared_buffer.write_timestamp))
+
+    def _notify_stim_publisher(self) -> None:
+        """Wake the heartbeat/publish thread after stim queue changes."""
+        if not self._in_loop:
+            self._stim_publish_event.set()
+
+    def _stim_publish_wait_interval(self) -> float:
+        """Return the next wait interval for heartbeat/stim publishing."""
+        if self._shared_buffer is None or self._in_loop:
+            return _HEARTBEAT_INTERVAL_S
+
+        with self._stim_lock:
+            next_stim_ts = self._stim_queue.peek_min_timestamp_from(self._stim_buffer_write_ts)
+
+        if next_stim_ts is None:
+            return _HEARTBEAT_INTERVAL_S
+
+        current_ts = _to_internal_ts(self._shared_buffer.write_timestamp)
+        frames_until = next_stim_ts - current_ts
+        if frames_until <= 0:
+            return 0.0
+
+        seconds_until = frames_until / self._frames_per_second
+        if seconds_until <= _STIM_PUBLISH_ACTIVE_WINDOW_S:
+            return _STIM_PUBLISH_ACTIVE_INTERVAL_S
+
+        return min(
+            _HEARTBEAT_INTERVAL_S,
+            max(_STIM_PUBLISH_ACTIVE_INTERVAL_S, seconds_until - _STIM_PUBLISH_ACTIVE_WINDOW_S),
+        )
+
+@dataclass(slots=True)
+class _StimOpRecord:
+    """
+    (Simulator only) Records a _queue_stims call so it can be replayed
+    when an interrupt changes channel availability.
+    """
+    from_timestamp: int
+    channel_set:    ChannelSet
+    stim_design:    StimDesign
+    burst_design:   BurstDesign | None
+    lead_time_us:   int
+
+@dataclass(slots=True)
+class _SyncOpRecord:
+    """
+    (Simulator only) Records a standalone _sync_channels call so it can be
+    replayed during rebuild-on-interrupt.
+    """
+    from_timestamp: int
+    channel_set:    ChannelSet
+
+# -- Rebuild mini-simulator opcodes -------------------------------------------
+# These lightweight opcode types mirror the reference simulator's opcode model
+# and are used only during _rebuild_stim_queue to compute correct stim timestamps
+# with lazy barrier sync resolution.
+
+class _RebuildStimNotice:
+    """Stim notice period (minimum lead time)."""
+    __slots__ = ()
+
+@dataclass(slots=True)
+class _RebuildStim:
+    """A stim opcode that records channel, duration and design for result collection."""
+    duration_steps: int
+    stim_duration:  int
+    channel:        int
+    stim_design:    StimDesign
+
+@dataclass(slots=True)
+class _RebuildDelay:
+    """A delay opcode."""
+    duration_steps: int
+
+@dataclass(slots=True)
+class _RebuildSync:
+    """Shared mutable sync barrier — same object referenced by all participating channels."""
+    channel_count: int
+
+@dataclass(slots=True)
+class _RebuildWaitUntil:
+    """Wait until a specific time step before proceeding."""
+    time_step: int
+
+@dataclass(slots=True)
+class _RebuildInterrupt:
+    """An interrupt that fires at a specific time step on a set of channels."""
+    time_step: int
+    channels:  set[int]
 
 class _StimOp:
     """ (Simulator only) Object representing a Stim Operation used in Neurons._stim_queue. """
 
-    stim: Stim
-    """ A Stim object. """
+    __slots__ = ("timestamp", "channel", "end_timestamp", "stim_design")
+
+    timestamp: int
+    """ Timestamp the stim is scheduled for in internal 50kHz time. """
+
+    channel: int
+    """ Channel the stim is scheduled on. """
 
     end_timestamp: int
     """
@@ -1551,17 +2558,26 @@ class _StimOp:
     2. Frequency delay in the case of stim bursts.
     """
 
-    def __init__(self, stim: Stim, end_timestamp: int) -> None:
-        self.stim          = stim
+    stim_design: StimDesign
+    """StimDesign used for this individual stim event."""
+
+    def __init__(self, timestamp: int, channel: int, end_timestamp: int, stim_design: StimDesign) -> None:
+        self.timestamp     = int(timestamp)
+        self.channel       = int(channel)
         self.end_timestamp = end_timestamp
+        self.stim_design   = stim_design
+
+    @property
+    def stim(self) -> Stim:
+        return Stim(self.timestamp, self.channel)
 
     def __repr__(self) -> str:
-        return f"StimOp(stim={self.stim}, end_timestamp={self.end_timestamp})"
+        return f"StimOp(timestamp={self.timestamp}, channel={self.channel}, end_timestamp={self.end_timestamp})"
 
     def __lt__(self, other: _StimOp) -> bool:
         """ (Simulator only) Compare two instances of StimOp for neurons._stim_queue. """
         assert isinstance(other, type(self)), \
             f"Cannot compare StimOp with {other.__class__.__name__}"
-        if self.stim.timestamp == other.stim.timestamp:
-            return self.stim.channel < other.stim.channel
-        return self.stim.timestamp < other.stim.timestamp
+        if self.timestamp == other.timestamp:
+            return self.channel < other.channel
+        return self.timestamp < other.timestamp

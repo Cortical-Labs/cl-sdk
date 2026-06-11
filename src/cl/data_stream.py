@@ -1,8 +1,11 @@
 import contextlib
+import logging
 from typing import Any, cast
 
-from ._data_buffer import DataStreamEventRecord
+from ._sim._data_buffer import DataStreamEventIndexRecord, DataStreamEventRecord
 from .util import to_msgpacked
+
+_logger = logging.getLogger("cl.data_stream")
 
 class DataStream:
     """
@@ -30,6 +33,12 @@ class DataStream:
         super().__init__()
         from . import Neurons
         neurons = cast("Neurons", neurons)
+        name_bytes = name.encode("utf-8")
+        if len(name_bytes) > DataStreamEventIndexRecord.MAX_STREAM_NAME_LENGTH:
+            raise ValueError(
+                f"DataStream name encoded length must be <= "
+                f"{DataStreamEventIndexRecord.MAX_STREAM_NAME_LENGTH} bytes, got {len(name_bytes)}"
+            )
         self.name = name
         self._neurons = neurons  # Keep reference for accessing shared buffer
 
@@ -63,12 +72,12 @@ class DataStream:
         msgpacked_data: bytes = to_msgpacked(data)  # type: ignore
         self._most_recent_ts = timestamp
 
-        # Push to all active recordings
+        # Write to shared buffer for WebSocket broadcasting
+        self._write_to_shared_buffer(timestamp, msgpacked_data)
+
+        # Forward to active recordings via command queue
         for recording in self._neurons._recordings:
             recording._write_data_stream_event(self.name, timestamp, msgpacked_data)
-
-        # Also write to shared buffer for WebSocket broadcasting
-        self._write_to_shared_buffer(timestamp, msgpacked_data)
 
     def set_attribute(self, key: str, value: Any):
         """
@@ -104,8 +113,15 @@ class DataStream:
                     stream_name = self.name,
                     data        = msgpacked_data
                 )
-                with contextlib.suppress(Exception):
+                try:
                     buffer.write_datastream_event(record)
+                except Exception:
+                    _logger.debug(
+                        "Failed to write data stream %r event at timestamp %s to shared buffer",
+                        self.name,
+                        timestamp,
+                        exc_info=True,
+                    )
 
     def _broadcast_attributes_updated(self, updated_attributes: dict[str, Any]):
         """Broadcast attribute update to WebSocket clients."""

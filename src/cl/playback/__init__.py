@@ -24,15 +24,16 @@ python -m cl.playback <recording_file.h5> [app_directory]
 
 Once the playback is running, the following keyboard controls are available:
 
-| Key                              | Action                    |
-|----------------------------------|---------------------------|
-| SPACE                            | Toggle pause/play         |
-| ← / →                            | Skip ±5 seconds           |
-| Shift (Ctrl on Windows) + ← / →  | Skip ±1 minute            |
-| g                                | Go to specific timestamp  |
-| r                                | Restart from beginning    |
-| h / ?                            | Show help                 |
-| q                                | Quit                      |
+| Key                              | Action                        |
+|----------------------------------|-------------------------------|
+| SPACE                            | Toggle pause/play             |
+| ← / →                            | Skip ±5 seconds               |
+| Shift (Ctrl on Windows) + ← / →  | Skip ±1 minute                |
+| ↑ / ↓                            | Speed up / slow down (±0.25x) |
+| g                                | Go to specific timestamp      |
+| r                                | Restart from beginning        |
+| h / ?                            | Show help                     |
+| q                                | Quit                          |
 
 ### Example
 

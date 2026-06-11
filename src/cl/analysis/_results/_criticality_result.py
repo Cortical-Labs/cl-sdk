@@ -1,11 +1,13 @@
+from __future__ import annotations
+
 from math import isfinite
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
-from matplotlib.gridspec import GridSpec
-from matplotlib.lines import Line2D
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.lines import Line2D
 
 from .. import (
     Array1DInt,
@@ -172,6 +174,9 @@ class AnalysisResultCriticality(AnalysisResult):
         Return:
             Axes: Axes on which the plot was drawn.
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+
         # Reference results data
         burst_sizes    = self.avalanche_spike_counts
         burst_min      = self.exclusion_bounds_spike_counts[0]
@@ -231,6 +236,9 @@ class AnalysisResultCriticality(AnalysisResult):
         Return:
             Axes: Axes on which the plot was drawn.
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+
         # Reference results data
         durations         = self.avalanche_durations
         duration_min      = self.exclusion_bounds_durations[0]
@@ -290,6 +298,9 @@ class AnalysisResultCriticality(AnalysisResult):
         Return:
             Axes: Axes on which the plot was drawn.
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+
         # Reference results data
         dcc = self.deviation_from_criticality_coefficient
         if not isfinite(dcc):
@@ -357,6 +368,9 @@ class AnalysisResultCriticality(AnalysisResult):
         Returns:
             list[Axes]: List of three Axes used to draw the plots.
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+
         # Reference results data
         avg_profiles     = self.mean_spike_counts_per_bin_by_duration
         durations        = self.unique_durations_within_threshold
@@ -470,6 +484,9 @@ class AnalysisResultCriticality(AnalysisResult):
         Return:
             Axes: Axes on which the plot was drawn.
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+
         from .._metrics._criticality import _exponential_function
         # Reference results data
         branching_ratio  = self.branching_ratio

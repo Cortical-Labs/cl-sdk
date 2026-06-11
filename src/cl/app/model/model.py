@@ -62,7 +62,7 @@ type StimFrequencyHz = Annotated[
     ),
 ]
 """
-A valid stimulation frequency, defined as a float greater than 0.0 and less than 10000.0 Hz.
+A valid stimulation frequency, defined as a float greater than 0.0 and not more than 200.0 Hz.
 """
 
 type StimmableChannel = Annotated[
@@ -118,40 +118,51 @@ class StimPulseComponentModel(FrozenBaseModel):
     """Pulse width of the component in microseconds."""
 
     signed_amplitude_ua: Annotated[
-        StimAmplitudeMicroAmps,
+        float,
         Field(
-            title       = "Signed Amplitude (µA)",
-            description = "The signed amplitude of the pulse component in microamperes. Must not be zero.",
-            ge          = -3.0,
-            le          = 3.0,
+            title         = "Signed Amplitude (µA)",
+            description   = "The signed amplitude of the pulse component in microamperes. Must not be zero.",
+            ge            = -3.0,
+            le            = 3.0,
+            allow_inf_nan = False,
         ),
     ]
     """Signed amplitude of the pulse component in microamperes."""
 
     @field_validator("signed_amplitude_ua", mode="after")
     @classmethod
-    def validate_non_zero_amplitude(cls, value: float) -> float:
+    def validate_non_zero_amplitude_and_charge(cls, value: float, info: ValidationInfo) -> float:
         """@private"""
         if value == 0.0:
             raise PydanticCustomError(
                 "zero_amplitude",
                 "Stimulation pulse component amplitude must be non-zero.",
             )
+
+        if "pulse_width_us" not in info.data:
+            return value
+
+        charge_nano_coulombs = abs(value) * info.data["pulse_width_us"] * 1e-3
+        if charge_nano_coulombs > 3.0:
+            raise PydanticCustomError(
+                "excessive_charge",
+                "The charge of each stimulation pulse component (amplitude * pulse width) must not exceed 3.0 nano Coulombs to ensure safety. The current component has a charge of {charge} nanoCoulombs.",
+                {"charge": charge_nano_coulombs},
+            )
         return value
 
 class StimDesignModel(FrozenBaseModel):
     """Configuration for a single stimulation design."""
 
-    model_config = ConfigDict(title="Stimulation Design", extra="forbid", frozen=True)
+    model_config = ConfigDict(title="Stimulation Design", extra="forbid", frozen=True, json_schema_extra={"format": "stim_design"})
 
     components: Annotated[
         list[StimPulseComponentModel],
         Field(
-            title             = "Stimulation Pulse Components",
-            description       = "List of stimulation pulse components (consisting from 1 to 3 components).",
-            json_schema_extra = {"format": "stim_pulse_components", "uniqueItems": False},
-            min_length        = 1,
-            max_length        = 3,
+            title       = "Stimulation Pulse Components",
+            description = "List of stimulation pulse components (consisting from 1 to 3 components).",
+            min_length  = 1,
+            max_length  = 3,
         ),
     ]
     """List of stimulation pulse components that make up the stimulation design. Must contain between 1 and 3 components."""
@@ -190,10 +201,10 @@ class StimFrequencyRangeHzModel(FrozenBaseModel):
 
     model_config = ConfigDict(title="Stimulation Frequency Range (Hz)", extra="forbid", frozen=True)
 
-    min: Annotated[StimFrequencyHz, Field(title="Minimum", description=None)]
+    min: Annotated[StimFrequencyHz, Field(title="Minimum", description="")]
     """Minimum value of the range, must be smaller than the maximum."""
 
-    max: Annotated[StimFrequencyHz, Field(title="Maximum", description=None)]
+    max: Annotated[StimFrequencyHz, Field(title="Maximum", description="")]
     """Maximum value of the range, must be greater than the minimum."""
 
     @property

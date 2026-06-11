@@ -8,11 +8,14 @@ import socketserver
 import threading
 from pathlib import Path
 from typing import ClassVar, override
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 _logger = logging.getLogger("cl.http_server")
 
-def _find_available_port(host: str = "127.0.0.1", start_port: int = 8000, max_attempts: int = 100) -> int:
+BASE_HOST    = "127.0.0.1"
+BASE_WS_PORT = 1025  # Starting port for WebSocket server; will auto-increment if unavailable
+
+def find_available_port(host: str = BASE_HOST, start_port: int = 8000, max_attempts: int = 100) -> int:
     """Find an available port starting from start_port."""
     for port in range(start_port, start_port + max_attempts):
         try:
@@ -28,8 +31,8 @@ class WebStaticHandler(http.server.SimpleHTTPRequestHandler):
 
     # Class-level configuration
     web_directory  : Path | None = None
-    websocket_port : int         = 1025
-    websocket_host : str         = "127.0.0.1"
+    websocket_port : int         = BASE_WS_PORT
+    websocket_host : str         = BASE_HOST
 
     app_html: ClassVar[str | None]  = None
 
@@ -39,6 +42,8 @@ class WebStaticHandler(http.server.SimpleHTTPRequestHandler):
 
     def translate_path(self, path: str) -> str:
         """Translate URL path to filesystem path, mapping /visualiser to the web directory."""
+        # Strip query string and fragment before processing
+        path = urlsplit(path).path
         # Decode URL encoding
         path = unquote(path)
 
@@ -59,25 +64,28 @@ class WebStaticHandler(http.server.SimpleHTTPRequestHandler):
     @override
     def do_GET(self) -> None:
         """Handle GET requests."""
+        # Strip query string and fragment for routing decisions
+        path = urlsplit(self.path).path
+
         # Handle the special /_/config endpoint to provide WebSocket configuration
-        if self.path in {"/_/config", "/_/config.json"}:
+        if path in {"/_/config", "/_/config.json"}:
             self._serve_config()
             return
 
         # Handle the /app endpoint for app visualiser
-        if self.path in {"/app", "/app/"}:
+        if path in {"/app", "/app/"}:
             self._serve_app_visualiser()
             return
 
         # Redirect root to /visualiser
-        if self.path in {"/", ""}:
+        if path in {"/", ""}:
             self.send_response(302)
             self.send_header("Location", "/visualiser")
             self.end_headers()
             return
 
         # Only serve files under /visualiser
-        if not self.path.startswith("/visualiser"):
+        if not path.startswith("/visualiser"):
             self.send_error(404, "Not Found")
             return
 
@@ -86,10 +94,13 @@ class WebStaticHandler(http.server.SimpleHTTPRequestHandler):
 
     @override
     def end_headers(self) -> None:
-        """Add CORS headers to all responses."""
+        """Add CORS and cache-control headers to all responses."""
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         super().end_headers()
 
     @override
@@ -111,7 +122,6 @@ class WebStaticHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(content)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(content)
 
@@ -144,9 +154,9 @@ class StaticHttpServer:
 
     def __init__(
         self,
-        websocket_host: str        = "127.0.0.1",
-        websocket_port: int        = 1025,
-        host          : str        = "127.0.0.1",
+        websocket_host: str        = BASE_HOST,
+        websocket_port: int        = BASE_WS_PORT,
+        host          : str        = BASE_HOST,
         app_html      : str | None = None,
     ):
         self._host           = host
@@ -161,9 +171,8 @@ class StaticHttpServer:
         self._running = False
 
         # Find the web directory relative to this file
-        self._web_directory = Path(__file__).parent / "web"
-        if not self._web_directory.exists():
-            _logger.warning("Web visualization directory not found: %s", self._web_directory)
+        self._web_directory = Path(__file__).parents[2] / "visualisation" / "web"
+        self._check_web_directory()
 
     @property
     def port(self) -> int | None:
@@ -184,17 +193,20 @@ class StaticHttpServer:
             return None
         return f"http://{self._host}:{self._port}/app" if self._app_html else None
 
+    def _check_web_directory(self) -> None:
+        """Raise RuntimeError if the web visualization directory does not exist."""
+        if not self._web_directory.exists():
+            raise RuntimeError(f"Web visualization directory not found: {self._web_directory}. Installation may be corrupt.")
+
     def start(self) -> None:
         """Start the HTTP server in a background thread."""
         if self._running:
             return
 
-        if not self._web_directory.exists():
-            _logger.warning("Cannot start MEA server: visualization directory not found")
-            return
+        self._check_web_directory()
 
         # Find an available port
-        self._port = _find_available_port(self._host)
+        self._port = find_available_port(self._host)
 
         # Configure the handler class
         WebStaticHandler.web_directory  = self._web_directory
