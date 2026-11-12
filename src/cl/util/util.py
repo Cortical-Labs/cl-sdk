@@ -622,7 +622,14 @@ def restricted_unpickling():
 # Debugging
 #
 
-def allow_debugging():
+def allow_debugging(host="127.0.0.1"):
+    """Arm SIGUSR1 to open a debugpy listener for remote debugging.
+
+    debugpy has no authentication of its own, so a listener on 0.0.0.0 is
+    arbitrary code execution for anyone who can reach the port. Defaults to
+    loopback only; pass host="0.0.0.0" explicitly if you really want it
+    reachable off box, e.g. behind an SSH tunnel you control instead.
+    """
     import signal
     import debugpy
 
@@ -632,7 +639,7 @@ def allow_debugging():
         DEFAULT_PORT = 5678
         for port in range(DEFAULT_PORT, DEFAULT_PORT + 4):
             try:
-                debugpy.listen(("0.0.0.0", port))
+                debugpy.listen((host, port))
                 break
             except RuntimeError as e:
                 if '[Errno 98]' in str(e): # yuck
